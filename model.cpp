@@ -463,11 +463,6 @@ public:
         return tensors_[it->second];
     }
 
-    const GgufTensorInfo* find(const std::string& name) const {
-        const auto it = tensor_index_.find(name);
-        return it == tensor_index_.end() ? nullptr : &tensors_[it->second];
-    }
-
     const uint8_t* pointer(const GgufTensorInfo& tensor, size_t row) const {
         const size_t bytes_per_row = gguf_row_bytes(tensor.type, tensor.columns());
         const size_t row_count = tensor.rows();
@@ -798,53 +793,24 @@ struct ModelFile::Impl {
         return dequantize_vector(file.require(name), expected_length);
     }
 
-    Vector optional_vector(const std::string& name, size_t expected_length) {
-        const GgufTensorInfo* tensor = file.find(name);
-        if (tensor == nullptr) {
-            return {};
-        }
-        return dequantize_vector(*tensor, expected_length);
-    }
-
     Matrix require_matrix(const std::string& name,
                           size_t expected_rows,
-                          size_t expected_columns,
-                          bool transpose) {
+                          size_t expected_columns) {
         const GgufTensorInfo& tensor = file.require(name);
         validate_tensor_shape(tensor, expected_rows, expected_columns);
 
-        // GGUF stores a linear layer as [output, input]. The llm::Matrix
-        // convention for a projection is [input, output], so load each GGUF
-        // row and write it into a column of the returned matrix when requested.
-        const size_t result_rows = transpose ? expected_columns : expected_rows;
-        const size_t result_columns = transpose ? expected_rows : expected_columns;
-        Matrix result(result_rows, result_columns);
-        std::vector<float> source_row(expected_columns);
+        // Preserve the tensor's native GGUF [output, input] layout. The
+        // runtime selects gemmt/gemmtb when it needs input * weight^T.
+        Matrix result(expected_rows, expected_columns);
         for (size_t source_row_index = 0;
              source_row_index < expected_rows;
              ++source_row_index) {
-            float* destination = transpose
-                ? source_row.data()
-                : result.values[source_row_index].values.data();
-            dequantizer.row(tensor, source_row_index, destination);
-
-            if (transpose) {
-                for (size_t source_column = 0;
-                     source_column < expected_columns;
-                     ++source_column) {
-                    result.values[source_column].values[source_row_index] =
-                        source_row[source_column];
-                }
-            }
+            dequantizer.row(
+                tensor, source_row_index,
+                result.values[source_row_index].values.data());
         }
         mark_loaded(tensor);
         return result;
-    }
-
-    Matrix require_transposed_matrix(const std::string& name,
-                                     size_t expected_rows,
-                                     size_t expected_columns) {
-        return require_matrix(name, expected_rows, expected_columns, true);
     }
 
     void validate_all_tensors_loaded() const {
@@ -896,8 +862,7 @@ Matrix ModelFile::load_token_embedding() {
     return impl_->require_matrix(
         "token_embd.weight",
         impl_->model_config.vocabulary_size,
-        impl_->model_config.embedding_size,
-        false);
+        impl_->model_config.embedding_size);
 }
 
 Vector ModelFile::load_output_norm() {
@@ -906,15 +871,10 @@ Vector ModelFile::load_output_norm() {
 }
 
 Matrix ModelFile::load_output_weight() {
-    return impl_->require_transposed_matrix(
+    return impl_->require_matrix(
         "output.weight",
         impl_->model_config.vocabulary_size,
         impl_->model_config.embedding_size);
-}
-
-Vector ModelFile::load_output_bias() {
-    return impl_->optional_vector(
-        "output.bias", impl_->model_config.vocabulary_size);
 }
 
 void ModelFile::validate_all_tensors_loaded() const {
@@ -934,36 +894,28 @@ Layer::Layer(ModelFile& model_file, size_t layer_index) {
 
     attn_norm_weight = loader.require_vector(
         prefix + "attn_norm.weight", config.embedding_size);
-    attn_q_weight = loader.require_transposed_matrix(
+    attn_q_weight = loader.require_matrix(
         prefix + "attn_q.weight", config.embedding_size, config.embedding_size);
-    attn_q_bias = loader.optional_vector(
+    attn_q_bias = loader.require_vector(
         prefix + "attn_q.bias", config.embedding_size);
-    attn_k_weight = loader.require_transposed_matrix(
+    attn_k_weight = loader.require_matrix(
         prefix + "attn_k.weight", kv_projection_size, config.embedding_size);
-    attn_k_bias = loader.optional_vector(
+    attn_k_bias = loader.require_vector(
         prefix + "attn_k.bias", kv_projection_size);
-    attn_v_weight = loader.require_transposed_matrix(
+    attn_v_weight = loader.require_matrix(
         prefix + "attn_v.weight", kv_projection_size, config.embedding_size);
-    attn_v_bias = loader.optional_vector(
+    attn_v_bias = loader.require_vector(
         prefix + "attn_v.bias", kv_projection_size);
-    attn_output_weight = loader.require_transposed_matrix(
+    attn_output_weight = loader.require_matrix(
         prefix + "attn_output.weight", config.embedding_size, config.embedding_size);
-    attn_output_bias = loader.optional_vector(
-        prefix + "attn_output.bias", config.embedding_size);
     ffn_norm_weight = loader.require_vector(
         prefix + "ffn_norm.weight", config.embedding_size);
-    ffn_gate_weight = loader.require_transposed_matrix(
+    ffn_gate_weight = loader.require_matrix(
         prefix + "ffn_gate.weight", config.feed_forward_size, config.embedding_size);
-    ffn_gate_bias = loader.optional_vector(
-        prefix + "ffn_gate.bias", config.feed_forward_size);
-    ffn_down_weight = loader.require_transposed_matrix(
+    ffn_down_weight = loader.require_matrix(
         prefix + "ffn_down.weight", config.embedding_size, config.feed_forward_size);
-    ffn_down_bias = loader.optional_vector(
-        prefix + "ffn_down.bias", config.embedding_size);
-    ffn_up_weight = loader.require_transposed_matrix(
+    ffn_up_weight = loader.require_matrix(
         prefix + "ffn_up.weight", config.feed_forward_size, config.embedding_size);
-    ffn_up_bias = loader.optional_vector(
-        prefix + "ffn_up.bias", config.feed_forward_size);
 }
 
 } // namespace llm

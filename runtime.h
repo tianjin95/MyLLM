@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -22,6 +23,11 @@ public:
     // Run a complete no-KV-cache forward pass over token_ids and return the
     // greedy next token predicted from the final position.
     int32_t forward(const std::vector<int32_t>& token_ids) const;
+
+    // Enable detailed operator timing and logical FLOP/traffic estimates.
+    // The CSV is truncated when profiling is enabled.
+    void enable_profiling(const std::string& csv_path);
+    void disable_profiling();
 
     std::string architecture;
     size_t tensor_count = 0;
@@ -46,8 +52,10 @@ public:
     Matrix token_embedding_weight;
     Vector output_norm_weight;
     Matrix output_weight;
-    Vector output_bias;
     std::vector<Layer> layers;
+
+private:
+    std::unique_ptr<Profiler> profiler_;
 };
 
 } // namespace llm

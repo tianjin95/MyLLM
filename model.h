@@ -47,10 +47,8 @@ public:
     // token id rather than multiplied as a linear layer.
     Matrix load_token_embedding();
     Vector load_output_norm();
-    // The output LM-head weight is returned as [input, vocab], ready for an
-    // input-row * weight GEMM/GEMV without a runtime transpose.
+    // The output LM-head weight keeps the GGUF-native [vocab, input] layout.
     Matrix load_output_weight();
-    Vector load_output_bias();
     void validate_all_tensors_loaded() const;
 
 private:
@@ -65,23 +63,21 @@ public:
     Layer(ModelFile& model_file, size_t layer_index);
 
     Vector attn_norm_weight;
-    // All projection matrices below use [input dimension, output dimension].
-    // This is the transpose of the [output, input] layout in GGUF.
+    // All projection matrices below keep the GGUF-native
+    // [output dimension, input dimension] layout.
     Matrix attn_q_weight;
     Vector attn_q_bias;
     Matrix attn_k_weight;
     Vector attn_k_bias;
     Matrix attn_v_weight;
     Vector attn_v_bias;
+    // Qwen2.5 has bias on Q/K/V only. Attention output and all FFN
+    // projections below are bias-free.
     Matrix attn_output_weight;
-    Vector attn_output_bias;
     Vector ffn_norm_weight;
     Matrix ffn_gate_weight;
-    Vector ffn_gate_bias;
     Matrix ffn_down_weight;
-    Vector ffn_down_bias;
     Matrix ffn_up_weight;
-    Vector ffn_up_bias;
 };
 
 } // namespace llm
