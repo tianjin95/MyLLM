@@ -1,4 +1,4 @@
-#include "llm.h"
+#include "cpu_llm.h"
 #include "model.h"
 #include "profiler.h"
 
@@ -31,111 +31,20 @@ void validate_matrix(const Matrix& matrix, const char* name) {
     }
 }
 
-uint64_t matrix_storage_bytes(size_t rows, size_t cols) {
-    return static_cast<uint64_t>(rows) *
-           static_cast<uint64_t>(cols) * sizeof(float);
-}
-
-ProfileMetrics matrix_copy_metrics(size_t rows, size_t cols) {
-    return profile_copy_metrics(
-        matrix_storage_bytes(rows, cols),
-        static_cast<uint64_t>(rows) + 1);
-}
-
-ProfileMetrics residual_profile_metrics(size_t rows, size_t cols) {
-    const uint64_t bytes = matrix_storage_bytes(rows, cols);
-    ProfileMetrics result;
-    result.read_bytes = bytes * 2;
-    result.write_bytes = bytes;
-    result.temporary_bytes = bytes;
-    result.allocations = static_cast<uint64_t>(rows) + 1;
-    return result;
-}
-
-ProfileMetrics mask_profile_metrics(size_t rows, size_t cols) {
-    size_t masked_elements = 0;
-    for (size_t row = 0; row < rows; ++row) {
-        if (row + 1 < cols) {
-            masked_elements += cols - row - 1;
-        }
+int32_t greedy_token(const Vector& logits) {
+    validate_vector(logits, "LM head logits");
+    if (logits.values.empty()) {
+        throw std::runtime_error("LM head produced no logits");
     }
-    ProfileMetrics result;
-    result.write_bytes = static_cast<uint64_t>(masked_elements) * sizeof(float);
-    return result;
-}
-
-ProfileMetrics attention_profile_metrics(const Matrix& hidden,
-                                         const Layer& layer,
-                                         size_t d_head) {
-    const size_t sequence_length = hidden.rows;
-    const size_t d_model = hidden.cols;
-    const size_t q_dimension = layer.attn_q_weight.rows;
-    const size_t kv_dimension = layer.attn_k_weight.rows;
-    const size_t q_heads = q_dimension / d_head;
-    const size_t kv_heads = kv_dimension / d_head;
-
-    ProfileMetrics result = matrix_copy_metrics(sequence_length, d_model);
-    result += profile_elementwise_metrics(
-        sequence_length * d_model, 5, 3, 1);
-    result += profile_gemmb_metrics(
-        sequence_length, q_dimension, d_model);
-    result += profile_gemmb_metrics(
-        sequence_length, kv_dimension, d_model);
-    result += profile_gemmb_metrics(
-        sequence_length, kv_dimension, d_model);
-
-    const uint64_t split_bytes =
-        matrix_storage_bytes(sequence_length, q_dimension) +
-        2 * matrix_storage_bytes(sequence_length, kv_dimension);
-    const uint64_t split_allocations =
-        static_cast<uint64_t>(q_heads + 2 * kv_heads) *
-        (static_cast<uint64_t>(sequence_length) + 1);
-    result += profile_copy_metrics(split_bytes, split_allocations);
-    result += profile_elementwise_metrics(
-        sequence_length * (q_dimension + kv_dimension), 6, 1, 1);
-
-    for (size_t head = 0; head < q_heads; ++head) {
-        ProfileMetrics qk = profile_gemm_metrics(
-            sequence_length, sequence_length, d_head);
-        qk.flops += static_cast<uint64_t>(sequence_length) * sequence_length;
-        result += qk;
-        result += mask_profile_metrics(sequence_length, sequence_length);
-        result += profile_elementwise_metrics(
-            sequence_length * sequence_length, 4, 3, 2);
-        result += profile_gemm_metrics(
-            sequence_length, d_head, sequence_length);
+    const auto best = std::max_element(
+        logits.values.begin(), logits.values.end());
+    const size_t token = static_cast<size_t>(
+        std::distance(logits.values.begin(), best));
+    if (token > static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
+        throw std::overflow_error(
+            "Generated token id does not fit in int32_t");
     }
-
-    const uint64_t head_output_bytes =
-        matrix_storage_bytes(sequence_length, q_dimension);
-    result += profile_copy_metrics(
-        head_output_bytes, static_cast<uint64_t>(q_heads) *
-                               (static_cast<uint64_t>(sequence_length) + 1));
-    result += profile_copy_metrics(
-        head_output_bytes, static_cast<uint64_t>(sequence_length) + 1);
-    result += profile_gemm_metrics(
-        sequence_length, d_model, q_dimension);
-    result += residual_profile_metrics(sequence_length, d_model);
-    return result;
-}
-
-ProfileMetrics ffn_profile_metrics(const Matrix& hidden, const Layer& layer) {
-    const size_t sequence_length = hidden.rows;
-    const size_t d_model = hidden.cols;
-    const size_t feed_forward = layer.ffn_gate_weight.rows;
-    ProfileMetrics result = matrix_copy_metrics(sequence_length, d_model);
-    result += profile_elementwise_metrics(
-        sequence_length * d_model, 5, 3, 1);
-    result += profile_gemm_metrics(
-        sequence_length, feed_forward, d_model);
-    result += profile_gemm_metrics(
-        sequence_length, feed_forward, d_model);
-    result += profile_elementwise_metrics(
-        sequence_length * feed_forward, 8, 2, 1);
-    result += profile_gemm_metrics(
-        sequence_length, d_model, feed_forward);
-    result += residual_profile_metrics(sequence_length, d_model);
-    return result;
+    return static_cast<int32_t>(token);
 }
 
 } // namespace
@@ -766,236 +675,6 @@ Matrix gemtmtb(const Matrix& left, const Matrix& right, const Vector& bias) {
     return result;
 }
     
-Matrix attention(const Matrix& hidden,
-                 const Layer& layer,
-                 float epsilon,
-                 size_t d_rope,
-                 float theta,
-                 size_t d_head,
-                 Profiler* profiler) {
-    if (d_head == 0 || d_rope == 0 || d_rope > d_head || d_rope % 2 != 0) {
-        throw std::invalid_argument("invalid Qwen2.5 attention head dimensions");
-    }
-
-    Profiler::Scope attention_total(
-        profiler, "attention.total", attention_profile_metrics(hidden, layer, d_head));
-
-    // Qwen2.5 pre-attention RMSNorm.
-    Matrix A;
-    {
-        ProfileMetrics metrics = matrix_copy_metrics(hidden.rows, hidden.cols);
-        metrics += profile_elementwise_metrics(
-            hidden.rows * hidden.cols, 5, 3, 1);
-        Profiler::Scope scope(profiler, "attention.rmsnorm", metrics);
-        A = hidden;
-        A.rmsnorm(layer.attn_norm_weight, epsilon);
-    }
-
-    // Q/K/V projections. The model loader keeps weights as [output, input],
-    // so input * weight^T is expressed by the existing GEMMTB operator.
-    // Qwen2.5 has Q/K/V bias tensors. Keep the operation visible here.
-    Matrix Q;
-    {
-        Profiler::Scope scope(
-            profiler, "attention.q_proj",
-            profile_gemmb_metrics(A.rows, layer.attn_q_weight.rows,
-                                  A.cols));
-        Q = gemmtb(A, layer.attn_q_weight, layer.attn_q_bias);
-    }
-    Matrix K;
-    {
-        Profiler::Scope scope(
-            profiler, "attention.k_proj",
-            profile_gemmb_metrics(A.rows, layer.attn_k_weight.rows,
-                                  A.cols));
-        K = gemmtb(A, layer.attn_k_weight, layer.attn_k_bias);
-    }
-    Matrix V;
-    {
-        Profiler::Scope scope(
-            profiler, "attention.v_proj",
-            profile_gemmb_metrics(A.rows, layer.attn_v_weight.rows,
-                                  A.cols));
-        V = gemmtb(A, layer.attn_v_weight, layer.attn_v_bias);
-    }
-
-    if (Q.cols % d_head != 0 || K.cols % d_head != 0 || V.cols != K.cols) {
-        throw std::invalid_argument("Qwen2.5 Q/K/V dimensions are not head-aligned");
-    }
-    const size_t kv_head_num = K.cols / d_head;
-    const size_t q_head_num = Q.cols / d_head;
-    if (kv_head_num == 0 || q_head_num == 0 || q_head_num % kv_head_num != 0) {
-        throw std::invalid_argument("invalid Qwen2.5 GQA head configuration");
-    }
-
-    std::vector<Matrix> HQ;
-    std::vector<Matrix> HK;
-    std::vector<Matrix> HV;
-    {
-        const uint64_t split_bytes =
-            matrix_storage_bytes(Q.rows, Q.cols) +
-            matrix_storage_bytes(K.rows, K.cols) +
-            matrix_storage_bytes(V.rows, V.cols);
-        const uint64_t split_allocations =
-            static_cast<uint64_t>(q_head_num + 2 * kv_head_num) *
-            (static_cast<uint64_t>(Q.rows) + 1);
-        Profiler::Scope scope(
-            profiler, "attention.split_heads",
-            profile_copy_metrics(split_bytes, split_allocations));
-        HQ = Q.split_heads(q_head_num);
-        HK = K.split_heads(kv_head_num);
-        HV = V.split_heads(kv_head_num);
-    }
-
-    // Matrix::rope applies position + row to every row, which is the token
-    // position used during a contiguous prefill.
-    {
-        ProfileMetrics metrics = profile_elementwise_metrics(
-            Q.rows * (Q.cols + K.cols), 6, 1, 1);
-        Profiler::Scope scope(profiler, "attention.rope", metrics);
-        for (size_t head = 0; head < q_head_num; ++head) {
-            HQ[head].rope(0, theta, d_rope);
-        }
-        for (size_t head = 0; head < kv_head_num; ++head) {
-            HK[head].rope(0, theta, d_rope);
-        }
-    }
-
-    // Causal scaled dot-product attention with GQA.
-    std::vector<Matrix> HS;
-    const size_t group_size = q_head_num / kv_head_num;
-    HS.reserve(q_head_num);
-    for (size_t head = 0; head < q_head_num; ++head) {
-        const size_t group = head / group_size;
-        Matrix S;
-        {
-            ProfileMetrics metrics = profile_gemm_metrics(
-                HQ[head].rows, HK[group].rows, d_head);
-            metrics.flops += static_cast<uint64_t>(HQ[head].rows) *
-                             HK[group].rows;
-            Profiler::Scope scope(profiler, "attention.qk", metrics);
-            S = gemmts(HQ[head], HK[group], d_head);
-        }
-        {
-            Profiler::Scope scope(
-                profiler, "attention.mask",
-                mask_profile_metrics(S.rows, S.cols));
-            S.causal_mask();
-        }
-        {
-            Profiler::Scope scope(
-                profiler, "attention.softmax",
-                profile_elementwise_metrics(S.rows * S.cols, 4, 3, 2));
-            S.softmax();
-        }
-        Matrix P;
-        {
-            Profiler::Scope scope(
-                profiler, "attention.av",
-                profile_gemm_metrics(S.rows, HV[group].cols, S.cols));
-            P = gemm(S, HV[group]);
-        }
-        {
-            Profiler::Scope scope(
-                profiler, "attention.head_copy",
-                matrix_copy_metrics(P.rows, P.cols));
-            HS.push_back(P);
-        }
-    }
-
-    // Concat
-    Matrix C;
-    {
-        Profiler::Scope scope(
-            profiler, "attention.concat",
-            matrix_copy_metrics(hidden.rows, Q.cols));
-        C = concat(HS);
-    }
-
-    // Qwen2.5 has no attention-output bias.
-    Matrix O;
-    {
-        Profiler::Scope scope(
-            profiler, "attention.output_proj",
-            profile_gemm_metrics(C.rows, layer.attn_output_weight.rows,
-                                 C.cols));
-        O = gemmt(C, layer.attn_output_weight);
-    }
-
-    // Attention residual.
-    Matrix result;
-    {
-        Profiler::Scope scope(
-            profiler, "attention.residual",
-            residual_profile_metrics(hidden.rows, hidden.cols));
-        result = residual(hidden, O);
-    }
-    return result;
-}
-
-Matrix ffn(const Matrix& hidden,
-           const Layer& layer,
-           float epsilon,
-           Profiler* profiler) {
-    Profiler::Scope ffn_total(
-        profiler, "ffn.total", ffn_profile_metrics(hidden, layer));
-
-    // Qwen2.5 pre-FFN RMSNorm.
-    Matrix normalized;
-    {
-        ProfileMetrics metrics = matrix_copy_metrics(hidden.rows, hidden.cols);
-        metrics += profile_elementwise_metrics(
-            hidden.rows * hidden.cols, 5, 3, 1);
-        Profiler::Scope scope(profiler, "ffn.rmsnorm", metrics);
-        normalized = hidden;
-        normalized.rmsnorm(layer.ffn_norm_weight, epsilon);
-    }
-
-    // SwiGLU: SiLU(gate) * up. Qwen2.5 has no FFN bias tensors.
-    Matrix gate;
-    {
-        Profiler::Scope scope(
-            profiler, "ffn.gate_proj",
-            profile_gemm_metrics(normalized.rows,
-                                 layer.ffn_gate_weight.rows,
-                                 normalized.cols));
-        gate = gemmt(normalized, layer.ffn_gate_weight);
-    }
-    Matrix up;
-    {
-        Profiler::Scope scope(
-            profiler, "ffn.up_proj",
-            profile_gemm_metrics(normalized.rows,
-                                 layer.ffn_up_weight.rows,
-                                 normalized.cols));
-        up = gemmt(normalized, layer.ffn_up_weight);
-    }
-    {
-        Profiler::Scope scope(
-            profiler, "ffn.swiglu",
-            profile_elementwise_metrics(gate.rows * gate.cols, 8, 2, 1));
-        gate.swiglu(up);
-    }
-
-    Matrix down;
-    {
-        Profiler::Scope scope(
-            profiler, "ffn.down_proj",
-            profile_gemm_metrics(gate.rows,
-                                 layer.ffn_down_weight.rows,
-                                 gate.cols));
-        down = gemmt(gate, layer.ffn_down_weight);
-    }
-    Matrix result;
-    {
-        Profiler::Scope scope(
-            profiler, "ffn.residual",
-            residual_profile_metrics(hidden.rows, hidden.cols));
-        result = residual(hidden, down);
-    }
-    return result;
-}
-
 namespace {
 
 std::pair<size_t, size_t> validate_kv_attention_shape(const Layer& layer,
@@ -1043,14 +722,15 @@ void validate_kv_cache(const Matrix& kc,
 
 } // namespace
 
-Matrix prefill(const Matrix& hidden,
-               const Layer& layer,
-               float epsilon,
-               size_t d_rope,
-               float theta,
-               size_t d_head,
-               Matrix& kc,
-               Matrix& vc) {
+Matrix cpu_prefill_layer(const Matrix& hidden,
+                         const Layer& layer,
+                         float epsilon,
+                         size_t d_rope,
+                         float theta,
+                         size_t d_head,
+                         CPUKVCache& cache) {
+    Matrix& kc = cache.key;
+    Matrix& vc = cache.value;
     validate_matrix(hidden, "Prefill hidden input");
     if (hidden.rows == 0 || hidden.cols == 0) {
         throw std::invalid_argument("Prefill hidden input cannot be empty");
@@ -1111,14 +791,15 @@ Matrix prefill(const Matrix& hidden,
     return residual(X, D);
 }
 
-Vector decode(const Vector& hidden,
-              const Layer& layer,
-              float epsilon,
-              size_t d_rope,
-              float theta,
-              size_t d_head,
-              Matrix& kc,
-              Matrix& vc) {
+Vector cpu_decode_layer(const Vector& hidden,
+                        const Layer& layer,
+                        float epsilon,
+                        size_t d_rope,
+                        float theta,
+                        size_t d_head,
+                        CPUKVCache& cache) {
+    Matrix& kc = cache.key;
+    Matrix& vc = cache.value;
     validate_vector(hidden, "Decode hidden input");
     if (hidden.lens == 0) {
         throw std::invalid_argument("Decode hidden input cannot be empty");
@@ -1183,4 +864,195 @@ Vector decode(const Vector& hidden,
     return residual(X, D);
 }
 
+struct CPULLM::Impl {
+    ModelConfig config;
+    Matrix token_embedding_weight;
+    Vector output_norm_weight;
+    Matrix output_weight;
+    std::vector<Layer> layers;
+    std::vector<CPUKVCache> kv_cache;
+    std::size_t max_sequence = 0;
+    std::size_t sequence_length = 0;
+    std::unique_ptr<Profiler> profiler;
+};
+
+CPULLM::CPULLM(const std::string& gguf_path, std::size_t max_sequence)
+    : impl_(std::make_unique<Impl>()) {
+    ModelFile model_file(gguf_path);
+    impl_->config = model_file.config();
+    if (impl_->config.layer_count == 0 ||
+        impl_->config.embedding_size == 0 ||
+        impl_->config.vocabulary_size == 0 ||
+        impl_->config.context_length == 0) {
+        throw std::runtime_error("CPU model metadata is incomplete");
+    }
+
+    if (max_sequence == 0) {
+        max_sequence = impl_->config.context_length;
+    }
+    if (max_sequence == 0 || max_sequence > impl_->config.context_length) {
+        throw std::invalid_argument(
+            "CPU maximum sequence must be within the model context length");
+    }
+
+    impl_->token_embedding_weight = model_file.load_token_embedding();
+    impl_->output_norm_weight = model_file.load_output_norm();
+    impl_->output_weight = model_file.load_output_weight();
+    impl_->layers.reserve(impl_->config.layer_count);
+    for (size_t layer_index = 0;
+         layer_index < impl_->config.layer_count;
+         ++layer_index) {
+        impl_->layers.emplace_back(model_file, layer_index);
+    }
+    model_file.validate_all_tensors_loaded();
+
+    impl_->max_sequence = max_sequence;
+    impl_->kv_cache.resize(impl_->layers.size());
 }
+
+CPULLM::~CPULLM() = default;
+
+CPULLM::CPULLM(CPULLM&&) noexcept = default;
+
+CPULLM& CPULLM::operator=(CPULLM&&) noexcept = default;
+
+void CPULLM::reset() {
+    if (impl_ == nullptr) {
+        throw std::runtime_error("CPU model is not initialized");
+    }
+    impl_->sequence_length = 0;
+    for (CPUKVCache& cache : impl_->kv_cache) {
+        cache = CPUKVCache{};
+    }
+}
+
+std::int32_t CPULLM::prefill(
+    const std::vector<std::int32_t>& token_ids) {
+    if (impl_ == nullptr) {
+        throw std::runtime_error("CPU model is not initialized");
+    }
+    if (token_ids.empty()) {
+        throw std::invalid_argument("CPU prefill requires at least one token");
+    }
+    if (impl_->sequence_length != 0) {
+        throw std::invalid_argument(
+            "CPU prefill requires an empty conversation; call reset first");
+    }
+    if (token_ids.size() > impl_->max_sequence) {
+        throw std::length_error("CPU prefill exceeds sequence capacity");
+    }
+    for (const int32_t token_id : token_ids) {
+        if (token_id < 0 ||
+            static_cast<size_t>(token_id) >= impl_->config.vocabulary_size) {
+            throw std::out_of_range(
+                "CPU prefill token id is outside the vocabulary");
+        }
+    }
+
+    Profiler::ForwardScope forward_profile(
+        impl_->profiler.get(), token_ids.size());
+    Matrix hidden = embedding(token_ids, impl_->token_embedding_weight);
+    for (size_t layer_index = 0;
+         layer_index < impl_->layers.size();
+         ++layer_index) {
+        Profiler::LayerScope layer_profile(
+            impl_->profiler.get(), layer_index);
+        hidden = cpu_prefill_layer(
+            hidden, impl_->layers[layer_index], impl_->config.norm_epsilon,
+            impl_->config.rotary_dimension, impl_->config.rope_theta,
+            impl_->config.head_size, impl_->kv_cache[layer_index]);
+    }
+    if (hidden.rows == 0 || hidden.values.empty()) {
+        throw std::runtime_error("CPU prefill produced an empty hidden matrix");
+    }
+    hidden.rmsnorm(
+        impl_->output_norm_weight, impl_->config.norm_epsilon);
+    const int32_t result = greedy_token(
+        gevmt(impl_->output_weight, hidden.values.back()));
+    impl_->sequence_length = token_ids.size();
+    return result;
+}
+
+std::int32_t CPULLM::decode(std::int32_t token_id) {
+    if (impl_ == nullptr) {
+        throw std::runtime_error("CPU model is not initialized");
+    }
+    if (impl_->sequence_length == 0) {
+        throw std::invalid_argument("CPU decode requires a completed prefill");
+    }
+    if (token_id < 0 ||
+        static_cast<size_t>(token_id) >= impl_->config.vocabulary_size) {
+        throw std::out_of_range(
+            "CPU decode token id is outside the vocabulary");
+    }
+    if (impl_->sequence_length >= impl_->max_sequence) {
+        throw std::length_error("CPU decode exceeds sequence capacity");
+    }
+    for (const CPUKVCache& cache : impl_->kv_cache) {
+        if (cache.key.rows != impl_->sequence_length ||
+            cache.value.rows != impl_->sequence_length) {
+            throw std::runtime_error(
+                "CPU KV-cache length does not match sequence position");
+        }
+    }
+
+    const size_t position = impl_->sequence_length;
+    Profiler::ForwardScope forward_profile(
+        impl_->profiler.get(), position + 1);
+    const Matrix embedded = embedding(
+        std::vector<int32_t>{token_id}, impl_->token_embedding_weight);
+    if (embedded.rows != 1 || embedded.values.empty()) {
+        throw std::runtime_error("CPU decode embedding is invalid");
+    }
+    Vector hidden = embedded.values.front();
+    for (size_t layer_index = 0;
+         layer_index < impl_->layers.size();
+         ++layer_index) {
+        Profiler::LayerScope layer_profile(
+            impl_->profiler.get(), layer_index);
+        hidden = cpu_decode_layer(
+            hidden, impl_->layers[layer_index], impl_->config.norm_epsilon,
+            impl_->config.rotary_dimension, impl_->config.rope_theta,
+            impl_->config.head_size, impl_->kv_cache[layer_index]);
+    }
+    hidden.rmsnorm(
+        impl_->output_norm_weight, impl_->config.norm_epsilon);
+    const int32_t result = greedy_token(
+        gevmt(impl_->output_weight, hidden));
+    impl_->sequence_length = position + 1;
+    return result;
+}
+
+void CPULLM::enable_profiling(const std::string& csv_path) {
+    if (impl_ == nullptr) {
+        throw std::runtime_error("CPU model is not initialized");
+    }
+    impl_->profiler = std::make_unique<Profiler>(csv_path);
+}
+
+void CPULLM::disable_profiling() {
+    if (impl_ != nullptr) {
+        impl_->profiler.reset();
+    }
+}
+
+const ModelConfig& CPULLM::config() const {
+    if (impl_ == nullptr) {
+        throw std::runtime_error("CPU model is not initialized");
+    }
+    return impl_->config;
+}
+
+std::size_t CPULLM::position() const noexcept {
+    return impl_ == nullptr ? 0 : impl_->sequence_length;
+}
+
+std::size_t CPULLM::max_sequence() const noexcept {
+    return impl_ == nullptr ? 0 : impl_->max_sequence;
+}
+
+bool CPULLM::uses_gpu() const noexcept {
+    return false;
+}
+
+} // namespace llm

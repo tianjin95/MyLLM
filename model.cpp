@@ -15,8 +15,8 @@ namespace llm {
 
 namespace {
 
-// The standalone runtime only needs this small GGUF reader.  It is kept
-// private to model.cpp so the public model/runtime headers remain tensor-only.
+// The standalone backends only need this small GGUF reader. It is kept private
+// to model.cpp so the public model and backend headers stay compact.
 constexpr uint32_t kGgufMagic = 0x46554747U;
 
 enum GgmlType : uint32_t {
@@ -800,7 +800,7 @@ struct ModelFile::Impl {
         validate_tensor_shape(tensor, expected_rows, expected_columns);
 
         // Preserve the tensor's native GGUF [output, input] layout. The
-        // runtime selects gemmt/gemmtb when it needs input * weight^T.
+        // The backend selects gemmt/gemmtb when it needs input * weight^T.
         Matrix result(expected_rows, expected_columns);
         for (size_t source_row_index = 0;
              source_row_index < expected_rows;

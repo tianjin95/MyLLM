@@ -2,6 +2,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <string>
 #include <vector>
 
 namespace llm {
@@ -80,8 +82,18 @@ class Matrix {
 
 };
 
+// CPU K/V cache for one transformer layer. CPULLM owns one instance per layer;
+// the matrices grow along the sequence dimension during generation.
+class CPUKVCache {
+public:
+    Matrix key;
+    Matrix value;
+
+    CPUKVCache() = default;
+};
+
 class Layer;
-class Profiler;
+struct ModelConfig;
 
 // Look up one embedding row for each token id. The embedding matrix uses
 // [vocabulary, embedding] layout and is not a projection weight.
@@ -112,21 +124,6 @@ Matrix gemtmt(const Matrix& left, const Matrix& right);
 // C = left^T * right^T + bias, with bias shared by every output row.
 Matrix gemtmtb(const Matrix& left, const Matrix& right, const Vector& bias);
     
-Matrix attention(const Matrix& hidden,
-                 const Layer& layer,
-                 float epsilon,
-                 size_t d_rope,
-                 float theta,
-                 size_t d_head,
-                 Profiler* profiler = nullptr);
-
-// Execute one Qwen2.5 feed-forward sublayer:
-// RMSNorm -> SwiGLU (gate/up) -> down projection -> residual.
-Matrix ffn(const Matrix& hidden,
-           const Layer& layer,
-           float epsilon,
-           Profiler* profiler = nullptr);
-
 // Concatenate matrices horizontally. All inputs must have the same row count;
 // the result contains their columns in input order.
 Matrix concat(const std::vector<Matrix>& matrices);
@@ -144,24 +141,53 @@ Vector residual(const Vector& left, const Vector& right);
 
 // Run one transformer layer over a prompt matrix. kc/vc are replaced with
 // [sequence, kv_heads * head_dim] caches; K is stored after per-head RoPE.
-Matrix prefill(const Matrix& hidden,
-               const Layer& layer,
-               float epsilon,
-               size_t d_rope,
-               float theta,
-               size_t d_head,
-               Matrix& kc,
-               Matrix& vc);
+Matrix cpu_prefill_layer(const Matrix& hidden,
+                         const Layer& layer,
+                         float epsilon,
+                         size_t d_rope,
+                         float theta,
+                         size_t d_head,
+                         CPUKVCache& cache);
 
 // Run one decode token through one transformer layer. The new rotated K/V
 // row is appended to kc/vc, whose previous rows must belong to this layer.
-Vector decode(const Vector& hidden,
-              const Layer& layer,
-              float epsilon,
-              size_t d_rope,
-              float theta,
-              size_t d_head,
-              Matrix& kc,
-              Matrix& vc);
+Vector cpu_decode_layer(const Vector& hidden,
+                        const Layer& layer,
+                        float epsilon,
+                        size_t d_rope,
+                        float theta,
+                        size_t d_head,
+                        CPUKVCache& cache);
 
-}
+// Complete CPU runtime for one loaded model. Model weights are shared across
+// turns, while reset() discards the current conversation's KV cache and
+// sequence position.
+class CPULLM {
+public:
+    explicit CPULLM(const std::string& gguf_path,
+                    std::size_t max_sequence = 0);
+    ~CPULLM();
+
+    CPULLM(const CPULLM&) = delete;
+    CPULLM& operator=(const CPULLM&) = delete;
+    CPULLM(CPULLM&&) noexcept;
+    CPULLM& operator=(CPULLM&&) noexcept;
+
+    void reset();
+    std::int32_t prefill(const std::vector<std::int32_t>& token_ids);
+    std::int32_t decode(std::int32_t token_id);
+
+    void enable_profiling(const std::string& csv_path);
+    void disable_profiling();
+
+    const ModelConfig& config() const;
+    std::size_t position() const noexcept;
+    std::size_t max_sequence() const noexcept;
+    bool uses_gpu() const noexcept;
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+} // namespace llm

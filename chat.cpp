@@ -1,7 +1,8 @@
 #include "chat.h"
 
-#include "kvc.h"
-#include "runtime.h"
+#include "cpu_llm.h"
+#include "metal_llm.h"
+#include "model.h"
 
 #include <algorithm>
 #include <chrono>
@@ -494,7 +495,7 @@ struct Options {
     std::string model_path;
     int max_new_tokens = 32;
     bool raw_prompt = false;
-    bool use_kv_cache = false;
+    bool use_gpu = false;
     bool help_requested = false;
     bool profiling_enabled = true;
     std::string profile_csv_path = "llm_profile.csv";
@@ -506,7 +507,7 @@ void usage(const char * program) {
               << "  --tokens N       Maximum generated tokens per input, default 32\n"
               << "  --system TEXT    System message used by ChatML\n"
               << "  --raw            Send input directly without ChatML wrapping\n"
-              << "  --kv             Use per-conversation KV cache prefill/decode\n"
+              << "  --gpu            Use the Metal GPU backend (no CPU fallback)\n"
               << "  --profile-csv P  Write timing/statistics CSV under output/\n"
               << "                   (default output/llm_profile.csv)\n"
               << "  --profile-log P  Compatibility alias for --profile-csv\n"
@@ -562,8 +563,8 @@ bool parse_options(int argc, char ** argv, Options & options) {
             options.system_prompt = value("--system");
         } else if (argument == "--raw") {
             options.raw_prompt = true;
-        } else if (argument == "--kv") {
-            options.use_kv_cache = true;
+        } else if (argument == "--gpu") {
+            options.use_gpu = true;
         } else if (argument == "--profile-csv") {
             options.profile_csv_path = value("--profile-csv");
         } else if (argument == "--profile-log") {
@@ -606,77 +607,53 @@ bool is_stop_token(int32_t token, const std::vector<int32_t> & stop_token_ids) {
     return contains_token(stop_token_ids, token);
 }
 
-void validate_generation_request(const llm::llm_runtime & runtime,
-                                 const std::vector<int32_t> & initial_sequence,
-                                 size_t max_new_tokens) {
+template <typename Backend>
+void validate_generation_request(
+    const Backend & backend,
+    const std::vector<int32_t> & initial_sequence,
+    size_t max_new_tokens) {
     if (initial_sequence.empty()) {
         throw std::invalid_argument("Generation requires at least one initial token");
     }
     if (max_new_tokens == 0) {
         throw std::invalid_argument("Generation requires max_new_tokens > 0");
     }
-    if (runtime.context_length == 0) {
-        throw std::runtime_error("Model context length is zero");
+    if (backend.max_sequence() == 0) {
+        throw std::runtime_error("Backend sequence capacity is zero");
     }
-    if (initial_sequence.size() >= runtime.context_length) {
+    if (initial_sequence.size() >= backend.max_sequence()) {
         throw std::invalid_argument(
             "Initial token sequence leaves no room for generated tokens");
     }
-    if (runtime.layers.size() != runtime.layer_count) {
-        throw std::runtime_error("Runtime layer storage is incomplete");
+    const llm::ModelConfig & config = backend.config();
+    if (config.layer_count == 0 || config.vocabulary_size == 0 ||
+        config.context_length == 0) {
+        throw std::runtime_error("Backend model metadata is incomplete");
     }
 }
 
-size_t generation_limit(const llm::llm_runtime & runtime,
+template <typename Backend>
+size_t generation_limit(const Backend & backend,
                         const std::vector<int32_t> & initial_sequence,
                         size_t max_new_tokens) {
     return std::min(
-        max_new_tokens, runtime.context_length - initial_sequence.size());
+        max_new_tokens, backend.max_sequence() - initial_sequence.size());
 }
 
-int32_t select_next_token(const llm::Vector & logits) {
-    if (logits.values.empty() || logits.lens != logits.values.size()) {
-        throw std::runtime_error("LM head produced no valid logits");
-    }
-    const auto best = std::max_element(logits.values.begin(), logits.values.end());
-    const size_t token = static_cast<size_t>(
-        std::distance(logits.values.begin(), best));
-    if (token > static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
-        throw std::overflow_error("Generated token id does not fit in int32_t");
-    }
-    return static_cast<int32_t>(token);
-}
-
-llm::Vector final_logits(llm::Matrix & hidden, const llm::llm_runtime & runtime) {
-    if (hidden.rows == 0 || hidden.values.empty()) {
-        throw std::runtime_error("Final hidden matrix is empty");
-    }
-    hidden.rmsnorm(runtime.output_norm_weight, runtime.norm_epsilon);
-    return runtime.project_logits(hidden.values.back());
-}
-
-llm::Vector embed_one_token(int32_t token, const llm::llm_runtime & runtime) {
-    const std::vector<int32_t> token_ids{token};
-    const llm::Matrix hidden = llm::embedding(
-        token_ids, runtime.token_embedding_weight);
-    if (hidden.rows != 1 || hidden.values.empty()) {
-        throw std::runtime_error("Single-token embedding produced an invalid matrix");
-    }
-    return hidden.values.front();
-}
-
+template <typename Backend>
 std::vector<int32_t> make_stop_tokens(const QwenTokenizer & tokenizer,
-                                      const llm::llm_runtime & runtime,
+                                      const Backend & backend,
                                       int32_t im_end,
                                       int32_t slash_s) {
+    const llm::ModelConfig & config = backend.config();
     std::vector<int32_t> result;
     auto add = [&](int32_t token) {
         if (token >= 0 && !contains_token(result, token)) result.push_back(token);
     };
-    add(runtime.eos_token_id);
+    add(config.eos_token_id);
     add(im_end);
     add(slash_s);
-    for (size_t token = 0; token < runtime.token_vocabulary.size(); ++token) {
+    for (size_t token = 0; token < config.vocabulary.size(); ++token) {
         const auto id = static_cast<int32_t>(token);
         if (tokenizer.is_special(id)) add(id);
     }
@@ -694,10 +671,10 @@ double tokens_per_second(size_t tokens, double milliseconds) {
     return static_cast<double>(tokens) * 1000.0 / milliseconds;
 }
 
-void print_generation_stats(const GenerationStats & stats, bool use_kv_cache) {
+void print_generation_stats(const GenerationStats & stats) {
     std::cerr << std::fixed << std::setprecision(3)
               << "[chat] generation_stats mode="
-              << (use_kv_cache ? "kv" : "no-kv")
+              << (stats.used_gpu ? "gpu-kv" : "cpu-kv")
               << " prompt_tokens=" << stats.prompt_tokens
               << " generated_tokens=" << stats.generated_tokens
               << " decode_steps=" << stats.decode_steps
@@ -712,8 +689,9 @@ void print_generation_stats(const GenerationStats & stats, bool use_kv_cache) {
               << '\n';
 }
 
+template <typename Backend>
 void run_turn(const Options & options,
-              llm::llm_runtime & runtime,
+              Backend & backend,
               const QwenTokenizer & tokenizer,
               const std::vector<int32_t> & stop_token_ids,
               const std::string & input) {
@@ -725,7 +703,8 @@ void run_turn(const Options & options,
         std::cerr << "[chat] tokenizer produced no tokens\n";
         return;
     }
-    if (runtime.context_length == 0 || sequence.size() >= runtime.context_length) {
+    if (backend.max_sequence() == 0 ||
+        sequence.size() >= backend.max_sequence()) {
         std::cerr << "[chat] prompt exceeds model context length\n";
         return;
     }
@@ -735,85 +714,36 @@ void run_turn(const Options & options,
     const TokenSink token_sink = [&tokenizer](int32_t token) {
         std::cout << tokenizer.decode_piece(token) << std::flush;
     };
-    const GenerationResult result = options.use_kv_cache
-        ? run_kv(runtime, sequence, static_cast<size_t>(options.max_new_tokens),
-                 stop_token_ids, token_sink)
-        : run(runtime, sequence, static_cast<size_t>(options.max_new_tokens),
-              stop_token_ids, token_sink);
+    const GenerationResult result = run(
+        backend, sequence, static_cast<size_t>(options.max_new_tokens),
+        stop_token_ids, token_sink);
     std::cout << '\n';
-    // run_kv owns its cache locally, so this report is emitted only after the
-    // cache has gone out of scope at the end of that function.
-    print_generation_stats(result.stats, options.use_kv_cache);
+    print_generation_stats(result.stats);
 }
 
-} // namespace
-
-GenerationResult run(llm::llm_runtime & runtime,
-                     std::vector<int32_t> initial_sequence,
-                     size_t max_new_tokens,
-                     const std::vector<int32_t> & stop_token_ids,
-                     TokenSink token_sink) {
-    validate_generation_request(runtime, initial_sequence, max_new_tokens);
+template <typename Backend>
+GenerationResult generate(Backend & backend,
+                          std::vector<int32_t> initial_sequence,
+                          size_t max_new_tokens,
+                          const std::vector<int32_t> & stop_token_ids,
+                          TokenSink token_sink) {
+    validate_generation_request(backend, initial_sequence, max_new_tokens);
 
     GenerationResult result;
     result.stats.prompt_tokens = initial_sequence.size();
-    const size_t limit = generation_limit(runtime, initial_sequence, max_new_tokens);
+    result.stats.used_gpu = backend.uses_gpu();
+    const size_t limit = generation_limit(
+        backend, initial_sequence, max_new_tokens);
     const Clock::time_point total_begin = Clock::now();
 
-    for (size_t step = 0; step < limit; ++step) {
-        const Clock::time_point step_begin = Clock::now();
-        const int32_t next = runtime.forward(initial_sequence);
-        const double step_ms = elapsed_ms(step_begin, Clock::now());
-        if (step == 0) {
-            result.stats.prefill_ms = step_ms;
-        } else {
-            result.stats.decode_ms += step_ms;
-            ++result.stats.decode_steps;
-        }
-
-        if (is_stop_token(next, stop_token_ids)) {
-            result.stats.stopped = true;
-            break;
-        }
-        result.generated_tokens.push_back(next);
-        ++result.stats.generated_tokens;
-        if (token_sink) token_sink(next);
-        initial_sequence.push_back(next);
-    }
-
-    result.stats.total_ms = elapsed_ms(total_begin, Clock::now());
-    return result;
-}
-
-GenerationResult run_kv(llm::llm_runtime & runtime,
-                        std::vector<int32_t> initial_sequence,
-                        size_t max_new_tokens,
-                        const std::vector<int32_t> & stop_token_ids,
-                        TokenSink token_sink) {
-    validate_generation_request(runtime, initial_sequence, max_new_tokens);
-
-    GenerationResult result;
-    result.stats.prompt_tokens = initial_sequence.size();
-    const size_t limit = generation_limit(runtime, initial_sequence, max_new_tokens);
-    const Clock::time_point total_begin = Clock::now();
-
-    // This vector is intentionally local to one generation request. Each
-    // conversation starts with empty caches, and destruction at function exit
-    // releases all layer K/V rows before the next turn begins.
-    std::vector<llm::KVC> kv_cache(runtime.layer_count);
+    // The backend retains its weights and owns the cache across turns.
+    // reset() makes that cache logically empty before this prompt.
+    backend.reset();
 
     int32_t next = 0;
     {
         const Clock::time_point prefill_begin = Clock::now();
-        llm::Matrix hidden = llm::embedding(
-            initial_sequence, runtime.token_embedding_weight);
-        for (size_t layer_index = 0; layer_index < runtime.layers.size(); ++layer_index) {
-            hidden = runtime.prefill_layer(
-                hidden, layer_index, kv_cache[layer_index].kc,
-                kv_cache[layer_index].vc);
-        }
-        const llm::Vector logits = final_logits(hidden, runtime);
-        next = select_next_token(logits);
+        next = backend.prefill(initial_sequence);
         result.stats.prefill_ms = elapsed_ms(prefill_begin, Clock::now());
     }
 
@@ -829,21 +759,91 @@ GenerationResult run_kv(llm::llm_runtime & runtime,
         if (step + 1 >= limit) break;
 
         const Clock::time_point decode_begin = Clock::now();
-        llm::Vector hidden = embed_one_token(next, runtime);
-        for (size_t layer_index = 0; layer_index < runtime.layers.size(); ++layer_index) {
-            hidden = runtime.decode_layer(
-                hidden, layer_index, kv_cache[layer_index].kc,
-                kv_cache[layer_index].vc);
-        }
-        hidden.rmsnorm(runtime.output_norm_weight, runtime.norm_epsilon);
-        const llm::Vector logits = runtime.project_logits(hidden);
-        next = select_next_token(logits);
+        next = backend.decode(next);
         result.stats.decode_ms += elapsed_ms(decode_begin, Clock::now());
         ++result.stats.decode_steps;
     }
 
     result.stats.total_ms = elapsed_ms(total_begin, Clock::now());
     return result;
+}
+
+std::string backend_description(const llm::CPULLM &) {
+    return "CPU";
+}
+
+std::string backend_description(const llm::MetalLLM & backend) {
+    return "Metal device=" + backend.device_name();
+}
+
+template <typename Backend>
+int run_interactive(const Options & options, Backend & backend) {
+    if (options.profiling_enabled) {
+        backend.enable_profiling(options.profile_csv_path);
+        std::cerr << "[chat] profile_csv=" << options.profile_csv_path << "\n";
+    }
+
+    const llm::ModelConfig & config = backend.config();
+    if (config.vocabulary.empty() || config.merges.empty()) {
+        throw std::runtime_error(
+            "model does not contain Qwen tokenizer vocabulary/merges");
+    }
+    QwenTokenizer tokenizer(config.vocabulary, config.merges);
+
+    const int32_t im_end = tokenizer.id("<|im_end|>");
+    if (im_end < 0) {
+        throw std::runtime_error(
+            "model vocabulary has no <|im_end|> token");
+    }
+    const int32_t slash_s = tokenizer.id("</s>");
+
+    std::cerr << "[chat] layers=" << config.layer_count
+              << " embedding=" << config.embedding_size
+              << " vocab=" << config.vocabulary_size
+              << " merges=" << config.merges.size()
+              << " context=" << config.context_length
+              << " capacity=" << backend.max_sequence()
+              << " backend=" << backend_description(backend)
+              << "\n";
+    std::cout << "Enter text (/exit to quit, /clear is accepted):\n";
+
+    const std::vector<int32_t> stop_token_ids = make_stop_tokens(
+        tokenizer, backend, im_end, slash_s);
+
+    std::string input;
+    while (std::cout << "> " && std::getline(std::cin, input)) {
+        if (input == "/exit" || input == "/quit") break;
+        if (input == "/clear") {
+            backend.reset();
+            std::cout << "[conversation cleared]\n";
+            continue;
+        }
+        run_turn(options, backend, tokenizer, stop_token_ids, input);
+    }
+    std::cout << "\n";
+    return 0;
+}
+
+} // namespace
+
+GenerationResult run(llm::CPULLM & backend,
+                     std::vector<int32_t> initial_sequence,
+                     size_t max_new_tokens,
+                     const std::vector<int32_t> & stop_token_ids,
+                     TokenSink token_sink) {
+    return generate(
+        backend, std::move(initial_sequence), max_new_tokens,
+        stop_token_ids, std::move(token_sink));
+}
+
+GenerationResult run(llm::MetalLLM & backend,
+                     std::vector<int32_t> initial_sequence,
+                     size_t max_new_tokens,
+                     const std::vector<int32_t> & stop_token_ids,
+                     TokenSink token_sink) {
+    return generate(
+        backend, std::move(initial_sequence), max_new_tokens,
+        stop_token_ids, std::move(token_sink));
 }
 
 int run_cli(int argc, char ** argv) {
@@ -858,43 +858,12 @@ int run_cli(int argc, char ** argv) {
         }
 
         std::cerr << "[chat] loading model: " << options.model_path << "\n";
-        llm::llm_runtime runtime(options.model_path);
-        if (options.profiling_enabled) {
-            runtime.enable_profiling(options.profile_csv_path);
-            std::cerr << "[chat] profile_csv=" << options.profile_csv_path << "\n";
+        if (options.use_gpu) {
+            llm::MetalLLM backend(options.model_path);
+            return run_interactive(options, backend);
         }
-        if (runtime.token_vocabulary.empty() || runtime.token_merges.empty()) {
-            throw std::runtime_error("model does not contain Qwen tokenizer vocabulary/merges");
-        }
-        QwenTokenizer tokenizer(runtime.token_vocabulary, runtime.token_merges);
-
-        const int32_t im_end = tokenizer.id("<|im_end|>");
-        if (im_end < 0) throw std::runtime_error("model vocabulary has no <|im_end|> token");
-        const int32_t slash_s = tokenizer.id("</s>");
-
-        std::cerr << "[chat] layers=" << runtime.layer_count
-                  << " embedding=" << runtime.embedding_size
-                  << " vocab=" << runtime.vocabulary_size
-                  << " merges=" << runtime.token_merges.size()
-                  << " context=" << runtime.context_length
-                  << (options.use_kv_cache ? " (KV cache)" : " (no KV cache)")
-                  << "\n";
-        std::cout << "Enter text (/exit to quit, /clear is accepted):\n";
-
-        const std::vector<int32_t> stop_token_ids = make_stop_tokens(
-            tokenizer, runtime, im_end, slash_s);
-
-        std::string input;
-        while (std::cout << "> " && std::getline(std::cin, input)) {
-            if (input == "/exit" || input == "/quit") break;
-            if (input == "/clear") {
-                std::cout << "[conversation cleared]\n";
-                continue;
-            }
-            run_turn(options, runtime, tokenizer, stop_token_ids, input);
-        }
-        std::cout << "\n";
-        return 0;
+        llm::CPULLM backend(options.model_path);
+        return run_interactive(options, backend);
     } catch (const std::exception & error) {
         std::cerr << "chat: " << error.what() << "\n";
         return 1;

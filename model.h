@@ -1,6 +1,6 @@
 #pragma once
 
-#include "llm.h"
+#include "cpu_llm.h"
 
 #include <cstddef>
 #include <cstdint>
