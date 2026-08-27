@@ -1,7 +1,7 @@
 # Standalone `llm` Chat Runtime
 
-This directory contains the FP32 Qwen2 runtime and its interactive text entry
-point. It can be compiled without the top-level CMake project and without
+This directory contains the standalone Qwen2 runtime and its interactive text
+entry point. It can be compiled without the top-level CMake project and without
 `llama.cpp`, GGML, or any dynamic inference library. The chat executable
 supports both the original complete-prefix path and an explicit per-turn
 KV-cache prefill/decode path.
@@ -22,6 +22,9 @@ llm.cpp               Vector/Matrix operators and Qwen2 attention/FFN operators
 model.cpp             GGUF reader, model loading, and FP32 weight conversion
 runtime.cpp           complete no-KV-cache forward and greedy next-token output
 profiler.cpp          operator timing and logical FLOP/traffic statistics
+metal_llm.h           Metal backend interface
+metal_llm.mm          Metal device, buffer, pipeline, and forward integration
+metal_llm.metal       FP32 Metal GEMM/GEVM kernels
 ```
 
 The GGUF reader and the F32/F16/Q5_0/Q8_0/Q4_K/Q6_K dequantizers are private
@@ -39,6 +42,26 @@ make -C cpp/MyLLM
 `CXX`, `CPPFLAGS`, `CXXFLAGS`, `LDFLAGS`, and `LDLIBS` can be overridden for a
 different compiler or target platform. The default compiler is `c++` and the
 required language standard is C++17.
+
+On macOS, the target links the system Metal and Foundation frameworks. The
+Metal library is compiled from `metal_llm.metal` at runtime, so the standalone
+build does not require the command-line `metal` tool. The executable searches
+for the shader in its working directory and next to the executable; an explicit
+location can be supplied with `MYLLM_METAL_SHADER=/path/to/metal_llm.metal`.
+
+After the GGUF weights have been loaded, model-side FP32 matrices and bias
+vectors used by linear layers are uploaded once into shared Metal buffers. Each
+GEMM dispatch uses a 16x16 tiled kernel, while GEVM uses one thread per output
+element. The existing `Matrix` type is intentionally unchanged, so transient
+activation matrices are flattened before dispatch and copied back after the
+command buffer completes. This first backend step synchronizes per linear
+operator; it is intended for correctness and kernel experiments rather than a
+fully fused, device-resident graph.
+
+Metal is selected automatically when a device and valid shader are available.
+If initialization fails, the program reports the reason and uses the original
+CPU operators. Set `MYLLM_DISABLE_METAL=1` to force that CPU reference path for
+token and timing comparisons.
 
 ## Run
 
@@ -159,6 +182,11 @@ per layer. In the default mode, both stages call `forward()`, so decode timing
 includes recomputation of the complete prefix. The cache is local to one turn
 and is released before the next prompt is read.
 
+When Metal is enabled, the `--kv` path also routes Q/K/V projections, attention
+QK/AV products, output projections, FFN projections, and the vocabulary GEVM
+through `MetalLLM`; the cache itself remains in the existing CPU `Matrix`
+objects in this first step.
+
 ## Forward path
 
 For a prompt with `N` tokens, `llm_runtime::forward()` executes:
@@ -188,16 +216,18 @@ fills one layer's `[position, kv_head * head_dim]` K/V matrices, storing K
 after per-head RoPE. `decode()` appends one new K/V row, applies the absolute
 RoPE position to the new Q/K, and computes attention over the cached prefix.
 `chat --kv` owns one K/V pair per transformer layer for exactly one turn and
-uses these APIs directly; no cache is retained across turns.
+uses the runtime's layer wrappers around these APIs; no cache is retained across
+turns.
 
 ## Memory and limitations
 
 The model is fully dequantized to `float` while loading. The Qwen2.5-0.5B
 model therefore needs substantially more memory than its approximately 468 MiB
 Q4_K_M file. Generation is greedy only; temperature sampling, batching,
-accelerator kernels, conversation history, and production-grade cache
-scheduling are not implemented. The layer-level `prefill()`/`decode()` APIs and
-the `chat --kv` path are intended for correctness and latency experiments.
+device-resident activation graphs, fused attention, conversation history, and
+production-grade cache scheduling are not implemented. The layer-level
+`prefill()`/`decode()` APIs and the `chat --kv` path are intended for correctness
+and latency experiments.
 
 The model file must exist before running. From `cpp/MyLLM/`, the default expected
 location is:

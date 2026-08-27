@@ -10,6 +10,8 @@
 
 namespace llm {
 
+class MetalLLM;
+
 class llm_runtime {
 public:
     explicit llm_runtime(const std::string& gguf_path);
@@ -23,6 +25,24 @@ public:
     // Run a complete no-KV-cache forward pass over token_ids and return the
     // greedy next token predicted from the final position.
     int32_t forward(const std::vector<int32_t>& token_ids) const;
+
+    // Report which linear-algebra backend is active.  Metal is selected by
+    // default on Apple platforms; setting MYLLM_DISABLE_METAL=1 forces the
+    // original CPU reference path.
+    bool metal_enabled() const noexcept;
+    const std::string& metal_device_name() const noexcept;
+
+    // Layer-level helpers used by chat's KV-cache path.  They fall back to the
+    // original free functions when Metal is unavailable.
+    Matrix prefill_layer(const Matrix& hidden,
+                         size_t layer_index,
+                         Matrix& key_cache,
+                         Matrix& value_cache) const;
+    Vector decode_layer(const Vector& hidden,
+                        size_t layer_index,
+                        Matrix& key_cache,
+                        Matrix& value_cache) const;
+    Vector project_logits(const Vector& hidden) const;
 
     // Enable detailed operator timing and logical FLOP/traffic estimates.
     // The CSV is truncated when profiling is enabled.
@@ -56,6 +76,7 @@ public:
 
 private:
     std::unique_ptr<Profiler> profiler_;
+    std::unique_ptr<MetalLLM> metal_backend_;
 };
 
 } // namespace llm

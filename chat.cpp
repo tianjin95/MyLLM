@@ -652,7 +652,7 @@ llm::Vector final_logits(llm::Matrix & hidden, const llm::llm_runtime & runtime)
         throw std::runtime_error("Final hidden matrix is empty");
     }
     hidden.rmsnorm(runtime.output_norm_weight, runtime.norm_epsilon);
-    return llm::gevmt(runtime.output_weight, hidden.values.back());
+    return runtime.project_logits(hidden.values.back());
 }
 
 llm::Vector embed_one_token(int32_t token, const llm::llm_runtime & runtime) {
@@ -808,11 +808,9 @@ GenerationResult run_kv(llm::llm_runtime & runtime,
         llm::Matrix hidden = llm::embedding(
             initial_sequence, runtime.token_embedding_weight);
         for (size_t layer_index = 0; layer_index < runtime.layers.size(); ++layer_index) {
-            const llm::Layer & layer = runtime.layers[layer_index];
-            hidden = llm::prefill(
-                hidden, layer, runtime.norm_epsilon, runtime.rotary_dimension,
-                runtime.rope_theta, runtime.head_size,
-                kv_cache[layer_index].kc, kv_cache[layer_index].vc);
+            hidden = runtime.prefill_layer(
+                hidden, layer_index, kv_cache[layer_index].kc,
+                kv_cache[layer_index].vc);
         }
         const llm::Vector logits = final_logits(hidden, runtime);
         next = select_next_token(logits);
@@ -833,14 +831,12 @@ GenerationResult run_kv(llm::llm_runtime & runtime,
         const Clock::time_point decode_begin = Clock::now();
         llm::Vector hidden = embed_one_token(next, runtime);
         for (size_t layer_index = 0; layer_index < runtime.layers.size(); ++layer_index) {
-            const llm::Layer & layer = runtime.layers[layer_index];
-            hidden = llm::decode(
-                hidden, layer, runtime.norm_epsilon, runtime.rotary_dimension,
-                runtime.rope_theta, runtime.head_size,
-                kv_cache[layer_index].kc, kv_cache[layer_index].vc);
+            hidden = runtime.decode_layer(
+                hidden, layer_index, kv_cache[layer_index].kc,
+                kv_cache[layer_index].vc);
         }
         hidden.rmsnorm(runtime.output_norm_weight, runtime.norm_epsilon);
-        const llm::Vector logits = llm::gevmt(runtime.output_weight, hidden);
+        const llm::Vector logits = runtime.project_logits(hidden);
         next = select_next_token(logits);
         result.stats.decode_ms += elapsed_ms(decode_begin, Clock::now());
         ++result.stats.decode_steps;

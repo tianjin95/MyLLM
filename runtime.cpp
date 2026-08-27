@@ -1,8 +1,12 @@
 #include "runtime.h"
 
+#include "metal_llm.h"
 #include "profiler.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
+#include <iostream>
 #include <limits>
 #include <stdexcept>
 
@@ -51,6 +55,30 @@ llm_runtime::llm_runtime(const std::string& gguf_path) {
     }
 
     model_file.validate_all_tensors_loaded();
+
+    const char* disable_metal = std::getenv("MYLLM_DISABLE_METAL");
+    const bool metal_is_disabled =
+        disable_metal != nullptr &&
+        (std::strcmp(disable_metal, "1") == 0 ||
+         std::strcmp(disable_metal, "true") == 0 ||
+         std::strcmp(disable_metal, "TRUE") == 0);
+    if (!metal_is_disabled) {
+        try {
+            metal_backend_ = std::make_unique<MetalLLM>();
+            metal_backend_->prepare(layers, output_weight);
+            std::cerr << "[MyLLM] backend=Metal device="
+                      << metal_backend_->device_name() << '\n';
+        } catch (const std::exception& error) {
+            // Keep the reference implementation usable on machines without a
+            // Metal device, an installed Metal source compiler, or enough
+            // shared memory for the cached FP32 weights.
+            std::cerr << "[MyLLM] Metal backend unavailable; using CPU: "
+                      << error.what() << '\n';
+            metal_backend_.reset();
+        }
+    } else {
+        std::cerr << "[MyLLM] backend=CPU (MYLLM_DISABLE_METAL is set)\n";
+    }
 }
 
 llm_runtime::~llm_runtime() = default;
@@ -58,6 +86,56 @@ llm_runtime::~llm_runtime() = default;
 llm_runtime::llm_runtime(llm_runtime&&) noexcept = default;
 
 llm_runtime& llm_runtime::operator=(llm_runtime&&) noexcept = default;
+
+bool llm_runtime::metal_enabled() const noexcept {
+    return metal_backend_ != nullptr && metal_backend_->available();
+}
+
+const std::string& llm_runtime::metal_device_name() const noexcept {
+    static const std::string empty;
+    return metal_backend_ == nullptr ? empty : metal_backend_->device_name();
+}
+
+Matrix llm_runtime::prefill_layer(const Matrix& hidden,
+                                  size_t layer_index,
+                                  Matrix& key_cache,
+                                  Matrix& value_cache) const {
+    if (layer_index >= layers.size()) {
+        throw std::out_of_range("Prefill layer index is outside the runtime");
+    }
+    const Layer& layer = layers[layer_index];
+    if (metal_enabled()) {
+        return metal_backend_->prefill(
+            hidden, layer, norm_epsilon, rotary_dimension, rope_theta,
+            head_size, key_cache, value_cache, profiler_.get());
+    }
+    return prefill(hidden, layer, norm_epsilon, rotary_dimension, rope_theta,
+                   head_size, key_cache, value_cache);
+}
+
+Vector llm_runtime::decode_layer(const Vector& hidden,
+                                 size_t layer_index,
+                                 Matrix& key_cache,
+                                 Matrix& value_cache) const {
+    if (layer_index >= layers.size()) {
+        throw std::out_of_range("Decode layer index is outside the runtime");
+    }
+    const Layer& layer = layers[layer_index];
+    if (metal_enabled()) {
+        return metal_backend_->decode(
+            hidden, layer, norm_epsilon, rotary_dimension, rope_theta,
+            head_size, key_cache, value_cache, profiler_.get());
+    }
+    return decode(hidden, layer, norm_epsilon, rotary_dimension, rope_theta,
+                  head_size, key_cache, value_cache);
+}
+
+Vector llm_runtime::project_logits(const Vector& hidden) const {
+    if (metal_enabled()) {
+        return metal_backend_->gevmt(output_weight, hidden);
+    }
+    return gevmt(output_weight, hidden);
+}
 
 void llm_runtime::enable_profiling(const std::string& csv_path) {
     profiler_ = std::make_unique<Profiler>(csv_path);
@@ -68,6 +146,9 @@ void llm_runtime::disable_profiling() {
 }
 
 int32_t llm_runtime::forward(const std::vector<int32_t>& token_ids) const {
+    if (metal_enabled()) {
+        return metal_backend_->forward(token_ids, *this, profiler_.get());
+    }
     if (token_ids.empty()) {
         throw std::invalid_argument("Forward requires at least one token id");
     }

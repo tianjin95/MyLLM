@@ -1,4 +1,5 @@
 CXX ?= c++
+OBJCXX ?= $(CXX)
 CPPFLAGS ?=
 CXXFLAGS ?= -O2 -Wall -Wextra -Wpedantic
 LDFLAGS ?=
@@ -9,6 +10,10 @@ CXXFLAGS += -std=c++17
 
 TARGET := chat
 BUILD_DIR := build
+METAL_OBJECT := $(BUILD_DIR)/metal_llm.o
+METAL_LDLIBS := -framework Metal -framework Foundation
+METAL_CXXFLAGS := -fobjc-arc
+LINKER := $(OBJCXX)
 
 MODEL ?= ../../models/qwen2.5-0.5b-instruct/qwen2.5-0.5b-instruct-q4_k_m.gguf
 # TOKENS is the canonical name; TOKEN is accepted as a compatibility alias.
@@ -24,14 +29,15 @@ OBJECTS := \
 	$(BUILD_DIR)/llm.o \
 	$(BUILD_DIR)/model.o \
 	$(BUILD_DIR)/runtime.o \
-	$(BUILD_DIR)/profiler.o
+	$(BUILD_DIR)/profiler.o \
+	$(METAL_OBJECT)
 
 .PHONY: all run clean help
 
 all: $(TARGET)
 
 $(TARGET): $(OBJECTS)
-	$(CXX) $(CXXFLAGS) $(LDFLAGS) $^ $(LDLIBS) -o $@
+	$(LINKER) $(CXXFLAGS) $(LDFLAGS) $^ $(LDLIBS) $(METAL_LDLIBS) -o $@
 
 $(BUILD_DIR):
 	mkdir -p $@
@@ -45,11 +51,14 @@ $(BUILD_DIR)/llm.o: llm.cpp llm.h model.h profiler.h | $(BUILD_DIR)
 $(BUILD_DIR)/model.o: model.cpp model.h llm.h | $(BUILD_DIR)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -MMD -MP -c $< -o $@
 
-$(BUILD_DIR)/runtime.o: runtime.cpp runtime.h model.h llm.h profiler.h | $(BUILD_DIR)
+$(BUILD_DIR)/runtime.o: runtime.cpp runtime.h metal_llm.h model.h llm.h profiler.h | $(BUILD_DIR)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -MMD -MP -c $< -o $@
 
 $(BUILD_DIR)/profiler.o: profiler.cpp profiler.h | $(BUILD_DIR)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -MMD -MP -c $< -o $@
+
+$(BUILD_DIR)/metal_llm.o: metal_llm.mm metal_llm.h metal_llm.metal runtime.h model.h llm.h profiler.h | $(BUILD_DIR)
+	$(OBJCXX) $(CPPFLAGS) $(CXXFLAGS) $(METAL_CXXFLAGS) -MMD -MP -c $< -o $@
 
 -include $(OBJECTS:.o=.d)
 
@@ -70,4 +79,5 @@ help:
 		'make run SYSTEM="..."     Set the ChatML system message' \
 		'make run PROFILE_CSV=...   Select a profile file under output/' \
 		'make run NO_PROFILE=1      Disable profiling for the run' \
+		'MYLLM_DISABLE_METAL=1 ...  Force the original CPU backend' \
 		'make clean                 Remove the executable and build objects'
