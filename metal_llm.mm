@@ -6,6 +6,7 @@
 #include "model.h"
 #include "profiler.h"
 
+#include <array>
 #include <algorithm>
 #include <climits>
 #include <cmath>
@@ -16,7 +17,6 @@
 #include <iterator>
 #include <limits>
 #include <mach-o/dyld.h>
-#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -170,6 +170,24 @@ size_t checked_bytes_for(size_t elements,
 
 size_t checked_bytes(size_t elements, const char* name) {
     return checked_bytes_for(elements, sizeof(float), name);
+}
+
+size_t checked_add_size(size_t left, size_t right, const char* name) {
+    if (right > std::numeric_limits<size_t>::max() - left) {
+        throw std::length_error(std::string(name) + " size overflows");
+    }
+    return left + right;
+}
+
+size_t align_up_size(size_t value, size_t alignment, const char* name) {
+    if (alignment == 0) {
+        throw std::invalid_argument(std::string(name) + " alignment is zero");
+    }
+    const size_t remainder = value % alignment;
+    if (remainder == 0) {
+        return value;
+    }
+    return checked_add_size(value, alignment - remainder, name);
 }
 
 uint32_t checked_uint(size_t value, const char* name) {
@@ -429,6 +447,39 @@ struct MetalLLM::Impl {
         size_t offset_elements = 0;
     };
 
+    // The activation graph is fixed for a loaded model. Each slot is a
+    // statically planned region inside activation_arena. Prefill and decode
+    // use different logical shapes but share these regions because only one
+    // execution is active at a time.
+    enum class ActivationSlot : uint8_t {
+        HiddenA,
+        HiddenB,
+        Norm,
+        Query,
+        RotatedQuery,
+        Key,
+        RotatedKey,
+        Value,
+        AttentionOutput,
+        AttentionScores,
+        Projection,
+        Gate,
+        Up,
+        Logits,
+        Count,
+    };
+
+    struct ArenaRegion {
+        size_t offset_bytes = 0;
+        size_t capacity_bytes = 0;
+    };
+
+    struct ActivationArenaPlan {
+        std::array<ArenaRegion,
+                   static_cast<size_t>(ActivationSlot::Count)> regions{};
+        size_t bytes = 0;
+    };
+
     // These descriptors own the model buffers for the whole lifetime of the
     // backend. They are built once during construction and are the only model
     // weights used by prefill/decode.
@@ -452,6 +503,7 @@ struct MetalLLM::Impl {
         DeviceVector output_norm_weight;
         DeviceMatrix output_weight;
         std::vector<PreparedLayer> layers;
+        size_t weight_bytes = 0;
         bool ready = false;
     };
 
@@ -463,16 +515,10 @@ struct MetalLLM::Impl {
 
     struct AsyncExecution {
         id<MTLCommandBuffer> command = nil;
-        struct TemporaryBuffer {
-            id<MTLBuffer> buffer = nil;
-            size_t capacity_bytes = 0;
-            bool reusable = false;
-        };
 
-        // Retain every temporary buffer until the command has completed. The
-        // caller returns them to Impl::temporary_pool after consuming any
-        // CPU-visible result.
-        std::vector<TemporaryBuffer> temporary_buffers;
+        // These are only CPU-visible staging/results. All tensor activations
+        // are views into activation_arena and are not stored here.
+        std::vector<id<MTLBuffer>> io_buffers;
     };
 
     id<MTLDevice> device = nil;
@@ -494,16 +540,13 @@ struct MetalLLM::Impl {
     ModelConfig config;
     PreparedModel prepared;
     std::vector<KVCacheLayer> kv_cache;
+    id<MTLBuffer> activation_arena = nil;
+    ActivationArenaPlan activation_plan;
+    size_t kv_cache_bytes = 0;
     size_t max_sequence = 0;
     size_t sequence_length = 0;
     std::unique_ptr<Profiler> profiler;
-    mutable std::mutex temporary_pool_mutex;
-    mutable std::unordered_map<size_t, std::vector<id<MTLBuffer>>>
-        temporary_pool;
-    mutable size_t temporary_pool_bytes = 0;
-
-    static constexpr size_t kMaxReusableTemporaryBytes = 16 * 1024 * 1024;
-    static constexpr size_t kMaxTemporaryPoolBytes = 256 * 1024 * 1024;
+    static constexpr size_t kArenaAlignment = 256;
 
     void require_available() const {
         if (device == nil || gemm_pipeline == nil || gevm_pipeline == nil ||
@@ -664,10 +707,144 @@ struct MetalLLM::Impl {
     void require_prepared() const {
         if (!prepared.ready || config.layer_count == 0 ||
             prepared.layers.size() != config.layer_count ||
-            kv_cache.size() != config.layer_count || max_sequence == 0) {
+            kv_cache.size() != config.layer_count ||
+            activation_arena == nil || activation_plan.bytes == 0 ||
+            max_sequence == 0) {
             throw std::runtime_error(
-                "Metal model weights or KV cache are not initialized");
+                "Metal model weights, activation arena, or KV cache are not initialized");
         }
+    }
+
+    static size_t slot_index(ActivationSlot slot) {
+        return static_cast<size_t>(slot);
+    }
+
+    ActivationArenaPlan make_activation_plan(size_t capacity) const {
+        if (capacity == 0) {
+            throw std::invalid_argument(
+                "Metal activation arena sequence capacity must be greater than zero");
+        }
+
+        const size_t hidden = config.embedding_size;
+        const size_t query = config.attention_head_count * config.head_size;
+        const size_t key_value = config.kv_head_count * config.head_size;
+        const size_t feed_forward = config.feed_forward_size;
+        const size_t vocabulary = config.vocabulary_size;
+        if (hidden == 0 || query == 0 || key_value == 0 || feed_forward == 0 ||
+            vocabulary == 0) {
+            throw std::runtime_error(
+                "Metal activation arena cannot be planned for incomplete model metadata");
+        }
+
+        ActivationArenaPlan plan;
+        const auto add_region = [&](ActivationSlot slot,
+                                    size_t elements,
+                                    const char* name) {
+            const size_t bytes = checked_bytes(elements, name);
+            const size_t offset = align_up_size(
+                plan.bytes, kArenaAlignment, name);
+            plan.regions[slot_index(slot)] = {offset, bytes};
+            plan.bytes = checked_add_size(offset, bytes, name);
+        };
+
+        // Hidden/norm/projection-sized slots are shared by prefill and decode.
+        // Norm is intentionally reused for attention norm, FFN norm, and the
+        // final norm because those lifetimes never overlap.
+        add_region(ActivationSlot::HiddenA,
+                   checked_elements(capacity, hidden, "Metal arena hidden A"),
+                   "Metal arena hidden A");
+        add_region(ActivationSlot::HiddenB,
+                   checked_elements(capacity, hidden, "Metal arena hidden B"),
+                   "Metal arena hidden B");
+        add_region(ActivationSlot::Norm,
+                   checked_elements(capacity, hidden, "Metal arena norm"),
+                   "Metal arena norm");
+        add_region(ActivationSlot::Query,
+                   checked_elements(capacity, query, "Metal arena query"),
+                   "Metal arena query");
+        add_region(ActivationSlot::RotatedQuery,
+                   checked_elements(capacity, query,
+                                    "Metal arena rotated query"),
+                   "Metal arena rotated query");
+        add_region(ActivationSlot::Key,
+                   checked_elements(capacity, key_value, "Metal arena key"),
+                   "Metal arena key");
+        add_region(ActivationSlot::RotatedKey,
+                   checked_elements(capacity, key_value,
+                                    "Metal arena rotated key"),
+                   "Metal arena rotated key");
+        add_region(ActivationSlot::Value,
+                   checked_elements(capacity, key_value, "Metal arena value"),
+                   "Metal arena value");
+        add_region(ActivationSlot::AttentionOutput,
+                   checked_elements(capacity, query,
+                                    "Metal arena attention output"),
+                   "Metal arena attention output");
+
+        // The current non-fused prefill attention kernel materializes one
+        // score/probability matrix per query head. Softmax is encoded in place,
+        // so one [max_sequence, max_sequence] region is sufficient and is
+        // reused for every head and every layer.
+        add_region(ActivationSlot::AttentionScores,
+                   checked_elements(capacity, capacity,
+                                    "Metal arena attention scores"),
+                   "Metal arena attention scores");
+        add_region(ActivationSlot::Projection,
+                   checked_elements(capacity, hidden,
+                                    "Metal arena projection"),
+                   "Metal arena projection");
+        add_region(ActivationSlot::Gate,
+                   checked_elements(capacity, feed_forward,
+                                    "Metal arena gate"),
+                   "Metal arena gate");
+        add_region(ActivationSlot::Up,
+                   checked_elements(capacity, feed_forward, "Metal arena up"),
+                   "Metal arena up");
+        add_region(ActivationSlot::Logits, vocabulary,
+                   "Metal arena logits");
+        plan.bytes = align_up_size(plan.bytes, kArenaAlignment,
+                                   "Metal activation arena");
+        return plan;
+    }
+
+    const ArenaRegion& arena_region(ActivationSlot slot) const {
+        return activation_plan.regions[slot_index(slot)];
+    }
+
+    DeviceMatrix arena_matrix(ActivationSlot slot,
+                              size_t rows,
+                              size_t cols,
+                              const char* operation) const {
+        if (activation_arena == nil) {
+            throw std::runtime_error(
+                "Metal activation arena is not initialized");
+        }
+        const ArenaRegion& region = arena_region(slot);
+        const size_t bytes = checked_bytes(
+            checked_elements(rows, cols, operation), operation);
+        if (bytes > region.capacity_bytes) {
+            throw std::length_error(std::string(operation) +
+                                    " exceeds its activation arena slot");
+        }
+        return {activation_arena, rows, cols, cols,
+                region.offset_bytes / sizeof(float)};
+    }
+
+    DeviceVector arena_vector(ActivationSlot slot,
+                              size_t length,
+                              const char* operation) const {
+        if (activation_arena == nil) {
+            throw std::runtime_error(
+                "Metal activation arena is not initialized");
+        }
+        const ArenaRegion& region = arena_region(slot);
+        const size_t bytes = checked_bytes(length, operation);
+        if (bytes > region.capacity_bytes) {
+            throw std::length_error(std::string(operation) +
+                                    " exceeds its activation arena slot");
+        }
+        return {activation_arena, length,
+                region.offset_bytes / sizeof(float)};
     }
 
     NSUInteger flat_threads(id<MTLComputePipelineState> pipeline) const {
@@ -697,6 +874,9 @@ struct MetalLLM::Impl {
     }
 
     AsyncExecution begin_async(const char* operation) const {
+        // The following encode_* calls only record work into this command
+        // buffer. They return buffer descriptors immediately; no kernel runs
+        // and no CPU wait occurs until finish_async() commits the full graph.
         AsyncExecution execution;
         execution.command = [queue commandBuffer];
         if (execution.command == nil) {
@@ -706,72 +886,20 @@ struct MetalLLM::Impl {
         return execution;
     }
 
-    size_t temporary_bucket_size(size_t bytes) const {
-        constexpr size_t kMinimumBucket = 256;
-        size_t bucket = kMinimumBucket;
-        while (bucket < bytes) {
-            if (bucket > std::numeric_limits<size_t>::max() / 2) {
-                return bytes;
-            }
-            bucket *= 2;
-        }
-        return bucket;
-    }
-
-    id<MTLBuffer> acquire_temporary_buffer(AsyncExecution& execution,
-                                           size_t bytes,
-                                           const char* operation) const {
-        if (bytes == 0) {
-            throw std::invalid_argument(std::string(operation) +
-                                        " buffer cannot be empty");
-        }
-        const size_t capacity = bytes <= kMaxReusableTemporaryBytes
-            ? temporary_bucket_size(bytes)
-            : bytes;
-        const bool reusable = capacity <= kMaxReusableTemporaryBytes;
-        id<MTLBuffer> buffer = nil;
-        if (reusable) {
-            std::lock_guard<std::mutex> lock(temporary_pool_mutex);
-            auto bucket = temporary_pool.find(capacity);
-            if (bucket != temporary_pool.end() && !bucket->second.empty()) {
-                buffer = bucket->second.back();
-                bucket->second.pop_back();
-                temporary_pool_bytes -= capacity;
-            }
-        }
-        if (buffer == nil) {
-            buffer = make_buffer(nullptr, capacity);
-        }
-        if (buffer == nil) {
-            throw std::runtime_error(std::string(
-                "Metal failed to allocate ") + operation + " buffer");
-        }
-        execution.temporary_buffers.push_back(
-            {buffer, capacity, reusable});
-        return buffer;
-    }
-
-    void recycle_temporary_buffers(AsyncExecution& execution) const {
-        std::lock_guard<std::mutex> lock(temporary_pool_mutex);
-        for (const AsyncExecution::TemporaryBuffer& temporary :
-             execution.temporary_buffers) {
-            if (temporary.reusable &&
-                temporary_pool_bytes <= kMaxTemporaryPoolBytes -
-                    temporary.capacity_bytes) {
-                temporary_pool[temporary.capacity_bytes].push_back(
-                    temporary.buffer);
-                temporary_pool_bytes += temporary.capacity_bytes;
-            }
-        }
-        execution.temporary_buffers.clear();
-    }
-
     id<MTLBuffer> async_buffer(AsyncExecution& execution,
                                const void* data,
                                size_t bytes,
                                const char* operation) const {
-        id<MTLBuffer> buffer = acquire_temporary_buffer(
-            execution, bytes, operation);
+        if (bytes == 0) {
+            throw std::invalid_argument(std::string(operation) +
+                                        " buffer cannot be empty");
+        }
+        id<MTLBuffer> buffer = make_buffer(nullptr, bytes);
+        if (buffer == nil) {
+            throw std::runtime_error(std::string(
+                "Metal failed to allocate ") + operation + " buffer");
+        }
+        execution.io_buffers.push_back(buffer);
         if (data != nullptr) {
             std::memcpy([buffer contents], data, bytes);
         }
@@ -798,24 +926,6 @@ struct MetalLLM::Impl {
         check_command(execution.command, operation);
     }
 
-    DeviceMatrix allocate_device_matrix(AsyncExecution& execution,
-                                        size_t rows,
-                                        size_t cols,
-                                        const char* operation) const {
-        const size_t elements = checked_elements(rows, cols, operation);
-        id<MTLBuffer> buffer = async_buffer(
-            execution, nullptr, checked_bytes(elements, operation), operation);
-        return {buffer, rows, cols, cols, 0};
-    }
-
-    DeviceVector allocate_device_vector(AsyncExecution& execution,
-                                        size_t length,
-                                        const char* operation) const {
-        id<MTLBuffer> buffer = async_buffer(
-            execution, nullptr, checked_bytes(length, operation), operation);
-        return {buffer, length, 0};
-    }
-
     id<MTLBuffer> async_token_ids(AsyncExecution& execution,
                                   const std::vector<int32_t>& token_ids) const {
         if (token_ids.empty()) {
@@ -833,14 +943,15 @@ struct MetalLLM::Impl {
                                   id<MTLBuffer> token_ids,
                                   const DeviceMatrix& embedding,
                                   size_t sequence_length,
-                                  size_t vocabulary_size) const {
+                                  size_t vocabulary_size,
+                                  ActivationSlot output_slot,
+                                  const char* operation) const {
         if (embedding.rows != vocabulary_size || embedding.cols == 0) {
             throw std::invalid_argument(
                 "Metal resident embedding weight shape is invalid");
         }
-        DeviceMatrix output = allocate_device_matrix(
-            execution, sequence_length, embedding.cols,
-            "Metal resident embedding");
+        DeviceMatrix output = arena_matrix(
+            output_slot, sequence_length, embedding.cols, operation);
         MetalEmbeddingParamsHost params;
         params.sequence_length = checked_uint(
             sequence_length, "Resident embedding sequence length");
@@ -857,7 +968,11 @@ struct MetalLLM::Impl {
                                             sizeof(float),
                                             "Resident embedding offset")
                   atIndex:1];
-        [encoder setBuffer:output.buffer offset:0 atIndex:2];
+        [encoder setBuffer:output.buffer
+                   offset:checked_bytes_for(output.offset_elements,
+                                            sizeof(float),
+                                            "Resident embedding output offset")
+                  atIndex:2];
         [encoder setBytes:&params length:sizeof(params) atIndex:3];
         dispatch_flat(encoder, embedding_pipeline,
                       checked_elements(sequence_length, embedding.cols,
@@ -873,6 +988,7 @@ struct MetalLLM::Impl {
                                        bool right_transposed,
                                        const DeviceVector* bias,
                                        float scale,
+                                       ActivationSlot output_slot,
                                        const char* operation) const {
         if (!std::isfinite(scale)) {
             throw std::invalid_argument(
@@ -891,8 +1007,7 @@ struct MetalLLM::Impl {
                 "Metal resident GEMM bias dimension does not match output");
         }
 
-        DeviceMatrix output = allocate_device_matrix(
-            execution, m, n, operation);
+        DeviceMatrix output = arena_matrix(output_slot, m, n, operation);
         if (m == 0 || n == 0) {
             return output;
         }
@@ -930,7 +1045,11 @@ struct MetalLLM::Impl {
                    offset:checked_bytes_for(bias_offset, sizeof(float),
                                             "Resident GEMM bias offset")
                   atIndex:2];
-        [encoder setBuffer:output.buffer offset:0 atIndex:3];
+        [encoder setBuffer:output.buffer
+                   offset:checked_bytes_for(output.offset_elements,
+                                            sizeof(float),
+                                            "Resident GEMM output offset")
+                  atIndex:3];
         [encoder setBytes:&params length:sizeof(params) atIndex:4];
 
         const MTLSize threadgroups = MTLSizeMake(
@@ -948,6 +1067,7 @@ struct MetalLLM::Impl {
                                        bool matrix_transposed,
                                        const DeviceVector* bias,
                                        float scale,
+                                       ActivationSlot output_slot,
                                        const char* operation) const {
         if (!std::isfinite(scale)) {
             throw std::invalid_argument(
@@ -966,8 +1086,7 @@ struct MetalLLM::Impl {
                 "Metal resident GEVM bias dimension does not match output");
         }
 
-        DeviceVector output = allocate_device_vector(
-            execution, output_size, operation);
+        DeviceVector output = arena_vector(output_slot, output_size, operation);
         if (output_size == 0) {
             return output;
         }
@@ -1001,7 +1120,11 @@ struct MetalLLM::Impl {
                    offset:checked_bytes_for(bias_offset, sizeof(float),
                                             "Resident GEVM bias offset")
                   atIndex:2];
-        [encoder setBuffer:output.buffer offset:0 atIndex:3];
+        [encoder setBuffer:output.buffer
+                   offset:checked_bytes_for(output.offset_elements,
+                                            sizeof(float),
+                                            "Resident GEVM output offset")
+                  atIndex:3];
         [encoder setBytes:&params length:sizeof(params) atIndex:4];
         const NSUInteger threads = std::min<NSUInteger>(
             kDefaultGemvThreads,
@@ -1018,13 +1141,14 @@ struct MetalLLM::Impl {
                                        const DeviceMatrix& input,
                                        const DeviceVector& gamma,
                                        float epsilon,
+                                       ActivationSlot output_slot,
                                        const char* operation) const {
         if (gamma.length != input.cols || input.rows == 0 || input.cols == 0) {
             throw std::invalid_argument(
                 "Metal resident RMSNorm matrix dimensions are invalid");
         }
-        DeviceMatrix output = allocate_device_matrix(
-            execution, input.rows, input.cols, operation);
+        DeviceMatrix output = arena_matrix(
+            output_slot, input.rows, input.cols, operation);
         MetalRmsNormParamsHost params;
         params.rows = checked_uint(input.rows, "Resident RMSNorm rows");
         params.cols = checked_uint(input.cols, "Resident RMSNorm columns");
@@ -1042,7 +1166,11 @@ struct MetalLLM::Impl {
                                             sizeof(float),
                                             "Resident RMSNorm gamma offset")
                   atIndex:1];
-        [encoder setBuffer:output.buffer offset:0 atIndex:2];
+        [encoder setBuffer:output.buffer
+                   offset:checked_bytes_for(output.offset_elements,
+                                            sizeof(float),
+                                            "Resident RMSNorm output offset")
+                  atIndex:2];
         [encoder setBytes:&params length:sizeof(params) atIndex:3];
         dispatch_rows(encoder, input.rows);
         [encoder endEncoding];
@@ -1053,13 +1181,14 @@ struct MetalLLM::Impl {
                                        const DeviceVector& input,
                                        const DeviceVector& gamma,
                                        float epsilon,
+                                       ActivationSlot output_slot,
                                        const char* operation) const {
         if (input.length == 0 || gamma.length != input.length) {
             throw std::invalid_argument(
                 "Metal resident RMSNorm vector dimensions are invalid");
         }
-        DeviceVector output = allocate_device_vector(
-            execution, input.length, operation);
+        DeviceVector output = arena_vector(
+            output_slot, input.length, operation);
         MetalRmsNormParamsHost params;
         params.rows = 1;
         params.cols = checked_uint(input.length, "Resident RMSNorm length");
@@ -1077,7 +1206,11 @@ struct MetalLLM::Impl {
                                             sizeof(float),
                                             "Resident RMSNorm gamma offset")
                   atIndex:1];
-        [encoder setBuffer:output.buffer offset:0 atIndex:2];
+        [encoder setBuffer:output.buffer
+                   offset:checked_bytes_for(output.offset_elements,
+                                            sizeof(float),
+                                            "Resident RMSNorm vector output offset")
+                  atIndex:2];
         [encoder setBytes:&params length:sizeof(params) atIndex:3];
         dispatch_rows(encoder, 1);
         [encoder endEncoding];
@@ -1086,13 +1219,14 @@ struct MetalLLM::Impl {
 
     DeviceMatrix encode_softmax_matrix(AsyncExecution& execution,
                                        const DeviceMatrix& input,
+                                       ActivationSlot output_slot,
                                        const char* operation) const {
         if (input.rows == 0 || input.cols == 0) {
             throw std::invalid_argument(
                 "Metal resident Softmax matrix cannot be empty");
         }
-        DeviceMatrix output = allocate_device_matrix(
-            execution, input.rows, input.cols, operation);
+        DeviceMatrix output = arena_matrix(
+            output_slot, input.rows, input.cols, operation);
         MetalElementwiseParamsHost params;
         params.rows = checked_uint(input.rows, "Resident Softmax rows");
         params.cols = checked_uint(input.cols, "Resident Softmax columns");
@@ -1104,7 +1238,11 @@ struct MetalLLM::Impl {
                                             sizeof(float),
                                             "Resident Softmax input offset")
                   atIndex:0];
-        [encoder setBuffer:output.buffer offset:0 atIndex:1];
+        [encoder setBuffer:output.buffer
+                   offset:checked_bytes_for(output.offset_elements,
+                                            sizeof(float),
+                                            "Resident Softmax output offset")
+                  atIndex:1];
         [encoder setBytes:&params length:sizeof(params) atIndex:2];
         dispatch_rows(encoder, input.rows);
         [encoder endEncoding];
@@ -1113,13 +1251,14 @@ struct MetalLLM::Impl {
 
     DeviceVector encode_softmax_vector(AsyncExecution& execution,
                                        const DeviceVector& input,
+                                       ActivationSlot output_slot,
                                        const char* operation) const {
         if (input.length == 0) {
             throw std::invalid_argument(
                 "Metal resident Softmax vector cannot be empty");
         }
-        DeviceVector output = allocate_device_vector(
-            execution, input.length, operation);
+        DeviceVector output = arena_vector(
+            output_slot, input.length, operation);
         MetalElementwiseParamsHost params;
         params.rows = 1;
         params.cols = checked_uint(input.length, "Resident Softmax length");
@@ -1131,7 +1270,11 @@ struct MetalLLM::Impl {
                                             sizeof(float),
                                             "Resident Softmax input offset")
                   atIndex:0];
-        [encoder setBuffer:output.buffer offset:0 atIndex:1];
+        [encoder setBuffer:output.buffer
+                   offset:checked_bytes_for(output.offset_elements,
+                                            sizeof(float),
+                                            "Resident Softmax vector output offset")
+                  atIndex:1];
         [encoder setBytes:&params length:sizeof(params) atIndex:2];
         dispatch_rows(encoder, 1);
         [encoder endEncoding];
@@ -1142,14 +1285,15 @@ struct MetalLLM::Impl {
                                       const DeviceMatrix& left,
                                       const DeviceMatrix& right,
                                       id<MTLComputePipelineState> pipeline,
+                                      ActivationSlot output_slot,
                                       const char* operation) const {
         if (left.rows != right.rows || left.cols != right.cols ||
             left.rows == 0 || left.cols == 0) {
             throw std::invalid_argument(
                 "Metal resident binary matrix dimensions are invalid");
         }
-        DeviceMatrix output = allocate_device_matrix(
-            execution, left.rows, left.cols, operation);
+        DeviceMatrix output = arena_matrix(
+            output_slot, left.rows, left.cols, operation);
         MetalElementwiseParamsHost params;
         params.rows = checked_uint(left.rows, "Resident binary rows");
         params.cols = checked_uint(left.cols, "Resident binary columns");
@@ -1165,7 +1309,11 @@ struct MetalLLM::Impl {
                                             sizeof(float),
                                             "Resident binary right offset")
                   atIndex:1];
-        [encoder setBuffer:output.buffer offset:0 atIndex:2];
+        [encoder setBuffer:output.buffer
+                   offset:checked_bytes_for(output.offset_elements,
+                                            sizeof(float),
+                                            "Resident binary output offset")
+                  atIndex:2];
         [encoder setBytes:&params length:sizeof(params) atIndex:3];
         dispatch_flat(encoder, pipeline,
                       checked_elements(left.rows, left.cols,
@@ -1178,13 +1326,14 @@ struct MetalLLM::Impl {
                                       const DeviceVector& left,
                                       const DeviceVector& right,
                                       id<MTLComputePipelineState> pipeline,
+                                      ActivationSlot output_slot,
                                       const char* operation) const {
         if (left.length != right.length || left.length == 0) {
             throw std::invalid_argument(
                 "Metal resident binary vector dimensions are invalid");
         }
-        DeviceVector output = allocate_device_vector(
-            execution, left.length, operation);
+        DeviceVector output = arena_vector(
+            output_slot, left.length, operation);
         MetalElementwiseParamsHost params;
         params.rows = 1;
         params.cols = checked_uint(left.length, "Resident binary length");
@@ -1200,7 +1349,11 @@ struct MetalLLM::Impl {
                                             sizeof(float),
                                             "Resident binary right offset")
                   atIndex:1];
-        [encoder setBuffer:output.buffer offset:0 atIndex:2];
+        [encoder setBuffer:output.buffer
+                   offset:checked_bytes_for(output.offset_elements,
+                                            sizeof(float),
+                                            "Resident binary vector output offset")
+                  atIndex:2];
         [encoder setBytes:&params length:sizeof(params) atIndex:3];
         dispatch_flat(encoder, pipeline, left.length);
         [encoder endEncoding];
@@ -1213,6 +1366,7 @@ struct MetalLLM::Impl {
                                           size_t rotary_dimension,
                                           size_t position,
                                           float theta,
+                                          ActivationSlot output_slot,
                                           const char* operation) const {
         if (input.rows == 0 || input.cols == 0 || head_dim == 0 ||
             input.cols % head_dim != 0 || rotary_dimension == 0 ||
@@ -1221,8 +1375,8 @@ struct MetalLLM::Impl {
             throw std::invalid_argument(
                 "Metal resident head-wise RoPE matrix dimensions are invalid");
         }
-        DeviceMatrix output = allocate_device_matrix(
-            execution, input.rows, input.cols, operation);
+        DeviceMatrix output = arena_matrix(
+            output_slot, input.rows, input.cols, operation);
         MetalRopeHeadsParamsHost params;
         params.rows = checked_uint(input.rows, "Resident RoPE rows");
         params.cols = checked_uint(input.cols, "Resident RoPE columns");
@@ -1238,7 +1392,11 @@ struct MetalLLM::Impl {
                                             sizeof(float),
                                             "Resident RoPE input offset")
                   atIndex:0];
-        [encoder setBuffer:output.buffer offset:0 atIndex:1];
+        [encoder setBuffer:output.buffer
+                   offset:checked_bytes_for(output.offset_elements,
+                                            sizeof(float),
+                                            "Resident RoPE output offset")
+                  atIndex:1];
         [encoder setBytes:&params length:sizeof(params) atIndex:2];
         dispatch_flat(encoder, rope_heads_pipeline,
                       checked_elements(input.rows, input.cols,
@@ -1253,6 +1411,7 @@ struct MetalLLM::Impl {
                                           size_t rotary_dimension,
                                           size_t position,
                                           float theta,
+                                          ActivationSlot output_slot,
                                           const char* operation) const {
         if (input.length == 0 || head_dim == 0 ||
             input.length % head_dim != 0 || rotary_dimension == 0 ||
@@ -1261,8 +1420,8 @@ struct MetalLLM::Impl {
             throw std::invalid_argument(
                 "Metal resident head-wise RoPE vector dimensions are invalid");
         }
-        DeviceVector output = allocate_device_vector(
-            execution, input.length, operation);
+        DeviceVector output = arena_vector(
+            output_slot, input.length, operation);
         MetalRopeHeadsParamsHost params;
         params.rows = 1;
         params.cols = checked_uint(input.length, "Resident RoPE length");
@@ -1278,7 +1437,11 @@ struct MetalLLM::Impl {
                                             sizeof(float),
                                             "Resident RoPE input offset")
                   atIndex:0];
-        [encoder setBuffer:output.buffer offset:0 atIndex:1];
+        [encoder setBuffer:output.buffer
+                   offset:checked_bytes_for(output.offset_elements,
+                                            sizeof(float),
+                                            "Resident RoPE vector output offset")
+                  atIndex:1];
         [encoder setBytes:&params length:sizeof(params) atIndex:2];
         dispatch_flat(encoder, rope_heads_pipeline, input.length);
         [encoder endEncoding];
@@ -1342,6 +1505,7 @@ struct MetalLLM::Impl {
                                     size_t cache_head,
                                     size_t query_position,
                                     float scale,
+                                    ActivationSlot output_slot,
                                     const char* operation) const {
         if (query == nil || key_cache == nil || query_rows == 0 ||
             key_length == 0 || head_dim == 0) {
@@ -1349,8 +1513,8 @@ struct MetalLLM::Impl {
                 "Metal resident KV-cache QK dimensions are invalid");
         }
 
-        DeviceMatrix output = allocate_device_matrix(
-            execution, query_rows, key_length, operation);
+        DeviceMatrix output = arena_matrix(
+            output_slot, query_rows, key_length, operation);
         MetalKVCacheQKParamsHost params;
         params.query_rows = checked_uint(
             query_rows, "Resident QK query rows");
@@ -1376,7 +1540,11 @@ struct MetalLLM::Impl {
                                             "Resident QK query offset")
                   atIndex:0];
         [encoder setBuffer:key_cache offset:0 atIndex:1];
-        [encoder setBuffer:output.buffer offset:0 atIndex:2];
+        [encoder setBuffer:output.buffer
+                   offset:checked_bytes_for(output.offset_elements,
+                                            sizeof(float),
+                                            "Resident QK output offset")
+                  atIndex:2];
         [encoder setBytes:&params length:sizeof(params) atIndex:3];
         dispatch_flat(encoder, kv_cache_qk_pipeline,
                       checked_elements(query_rows, key_length,
@@ -1386,9 +1554,9 @@ struct MetalLLM::Impl {
     }
 
     void encode_kv_cache_av(AsyncExecution& execution,
-                            id<MTLBuffer> scores,
+                            const DeviceMatrix& scores,
                             id<MTLBuffer> value_cache,
-                            id<MTLBuffer> output,
+                            const DeviceMatrix& output,
                             size_t query_rows,
                             size_t key_length,
                             size_t cache_stride,
@@ -1398,7 +1566,8 @@ struct MetalLLM::Impl {
                             size_t output_stride,
                             size_t output_offset,
                             const char* operation) const {
-        if (scores == nil || value_cache == nil || output == nil ||
+        if (scores.buffer == nil || value_cache == nil ||
+            output.buffer == nil ||
             query_rows == 0 || key_length == 0 || head_dim == 0 ||
             output_stride == 0) {
             throw std::invalid_argument(
@@ -1425,9 +1594,17 @@ struct MetalLLM::Impl {
 
         id<MTLComputeCommandEncoder> encoder = async_encoder(
             execution, kv_cache_av_pipeline, operation);
-        [encoder setBuffer:scores offset:0 atIndex:0];
+        [encoder setBuffer:scores.buffer
+                   offset:checked_bytes_for(scores.offset_elements,
+                                            sizeof(float),
+                                            "Resident AV score offset")
+                  atIndex:0];
         [encoder setBuffer:value_cache offset:0 atIndex:1];
-        [encoder setBuffer:output offset:0 atIndex:2];
+        [encoder setBuffer:output.buffer
+                   offset:checked_bytes_for(output.offset_elements,
+                                            sizeof(float),
+                                            "Resident AV output offset")
+                  atIndex:2];
         [encoder setBytes:&params length:sizeof(params) atIndex:3];
         dispatch_flat(encoder, kv_cache_av_pipeline,
                       checked_elements(query_rows, head_dim,
@@ -1436,10 +1613,10 @@ struct MetalLLM::Impl {
     }
 
     id<MTLBuffer> encode_argmax(AsyncExecution& execution,
-                                id<MTLBuffer> input,
+                                const DeviceVector& input,
                                 size_t length,
                                 const char* operation) const {
-        if (input == nil || length == 0) {
+        if (input.buffer == nil || length == 0) {
             throw std::invalid_argument(
                 "Metal resident argmax input cannot be empty");
         }
@@ -1449,7 +1626,11 @@ struct MetalLLM::Impl {
         params.length = checked_uint(length, "Resident argmax length");
         id<MTLComputeCommandEncoder> encoder = async_encoder(
             execution, argmax_pipeline, operation);
-        [encoder setBuffer:input offset:0 atIndex:0];
+        [encoder setBuffer:input.buffer
+                   offset:checked_bytes_for(input.offset_elements,
+                                            sizeof(float),
+                                            "Resident argmax input offset")
+                  atIndex:0];
         [encoder setBuffer:output offset:0 atIndex:1];
         [encoder setBytes:&params length:sizeof(params) atIndex:2];
         [encoder dispatchThreads:MTLSizeMake(1, 1, 1)
@@ -1481,7 +1662,8 @@ struct MetalLLM::Impl {
                                       id<MTLBuffer> key_cache,
                                       id<MTLBuffer> value_cache,
                                       size_t cache_stride,
-                                      size_t position) const;
+                                      size_t position,
+                                      ActivationSlot output_slot) const;
 
     DeviceVector encode_decode_layer(AsyncExecution& execution,
                                      const DeviceVector& hidden,
@@ -1493,13 +1675,15 @@ struct MetalLLM::Impl {
                                      id<MTLBuffer> key_cache,
                                      id<MTLBuffer> value_cache,
                                      size_t cache_stride,
-                                     size_t position) const;
+                                     size_t position,
+                                     ActivationSlot output_slot) const;
 
     void upload_model(const std::vector<Layer>& layers,
                       const Matrix& output_weight,
                       const Matrix& token_embedding_weight,
                       const Vector& output_norm_weight);
     void allocate_kv_cache(size_t capacity);
+    void allocate_activation_arena(size_t capacity);
     void load_model(const std::string& gguf_path, size_t capacity);
 };
 
@@ -1514,7 +1698,8 @@ MetalLLM::Impl::DeviceMatrix MetalLLM::Impl::encode_prefill_layer(
     id<MTLBuffer> key_cache,
     id<MTLBuffer> value_cache,
     size_t cache_stride,
-    size_t position) const {
+    size_t position,
+    ActivationSlot output_slot) const {
     const size_t q_dimension = layer.attn_q_weight.rows;
     const size_t kv_dimension = layer.attn_k_weight.rows;
     const size_t q_head_count = q_dimension / d_head;
@@ -1533,9 +1718,13 @@ MetalLLM::Impl::DeviceMatrix MetalLLM::Impl::encode_prefill_layer(
             "Metal resident prefill key length overflows");
     }
 
+    // Every helper below appends another dispatch to the same command buffer.
+    // Ending an encoder establishes command order; Metal's tracked resources
+    // make one kernel's writes visible to the next without a CPU-side barrier.
     const DeviceVector& attn_norm = layer.attn_norm_weight;
     const DeviceMatrix normalized = encode_rmsnorm_matrix(
-        execution, hidden, attn_norm, epsilon, "resident prefill attention norm");
+        execution, hidden, attn_norm, epsilon, ActivationSlot::Norm,
+        "resident prefill attention norm");
 
     const DeviceMatrix& q_weight = layer.attn_q_weight;
     const DeviceVector& q_bias = layer.attn_q_bias;
@@ -1546,19 +1735,24 @@ MetalLLM::Impl::DeviceMatrix MetalLLM::Impl::encode_prefill_layer(
 
     const DeviceMatrix query = encode_matrix_product(
         execution, normalized, q_weight, false, true, &q_bias, 1.0f,
+        ActivationSlot::Query,
         "resident prefill Q projection");
     const DeviceMatrix key = encode_matrix_product(
         execution, normalized, k_weight, false, true, &k_bias, 1.0f,
+        ActivationSlot::Key,
         "resident prefill K projection");
     const DeviceMatrix value = encode_matrix_product(
         execution, normalized, v_weight, false, true, &v_bias, 1.0f,
+        ActivationSlot::Value,
         "resident prefill V projection");
 
     const DeviceMatrix rotated_query = encode_rope_heads_matrix(
         execution, query, d_head, d_rope, position, theta,
+        ActivationSlot::RotatedQuery,
         "resident prefill Q RoPE");
     const DeviceMatrix rotated_key = encode_rope_heads_matrix(
         execution, key, d_head, d_rope, position, theta,
+        ActivationSlot::RotatedKey,
         "resident prefill K RoPE");
     encode_kv_cache_write(
         execution, rotated_key, value, key_cache, value_cache, position,
@@ -1566,8 +1760,8 @@ MetalLLM::Impl::DeviceMatrix MetalLLM::Impl::encode_prefill_layer(
 
     // AV writes each head directly into its final packed [sequence, Q]
     // layout. This removes both per-head split buffers and the later concat.
-    const DeviceMatrix attention_output = allocate_device_matrix(
-        execution, hidden.rows, q_dimension,
+    const DeviceMatrix attention_output = arena_matrix(
+        ActivationSlot::AttentionOutput, hidden.rows, q_dimension,
         "resident prefill attention output");
     const size_t group_size = q_head_count / kv_head_count;
     for (size_t head = 0; head < q_head_count; ++head) {
@@ -1575,15 +1769,18 @@ MetalLLM::Impl::DeviceMatrix MetalLLM::Impl::encode_prefill_layer(
         const size_t head_offset = checked_elements(
             head, d_head, "Resident prefill Q head offset");
         const DeviceMatrix scores = encode_kv_cache_qk(
-            execution, rotated_query.buffer, head_offset, hidden.rows,
+            execution, rotated_query.buffer,
+            rotated_query.offset_elements + head_offset, hidden.rows,
             key_length, key_cache, cache_stride, q_dimension, d_head, group,
             position, 1.0f / std::sqrt(static_cast<float>(d_head)),
+            ActivationSlot::AttentionScores,
             "resident prefill QK");
         const DeviceMatrix probabilities = encode_softmax_matrix(
-            execution, scores, "resident prefill Softmax");
+            execution, scores, ActivationSlot::AttentionScores,
+            "resident prefill Softmax");
         encode_kv_cache_av(
-            execution, probabilities.buffer, value_cache,
-            attention_output.buffer, hidden.rows, key_length, cache_stride,
+            execution, probabilities, value_cache, attention_output,
+            hidden.rows, key_length, cache_stride,
             key_length, d_head, group, q_dimension, head_offset,
             "resident prefill AV");
     }
@@ -1591,31 +1788,39 @@ MetalLLM::Impl::DeviceMatrix MetalLLM::Impl::encode_prefill_layer(
     const DeviceMatrix& output_weight = layer.attn_output_weight;
     const DeviceMatrix attention_projected = encode_matrix_product(
         execution, attention_output, output_weight, false, true, nullptr, 1.0f,
+        ActivationSlot::Projection,
         "resident prefill attention output projection");
     const DeviceMatrix after_attention = encode_binary_matrix(
         execution, hidden, attention_projected, residual_pipeline,
+        output_slot,
         "resident prefill attention residual");
 
     const DeviceVector& ffn_norm = layer.ffn_norm_weight;
     const DeviceMatrix ffn_input = encode_rmsnorm_matrix(
         execution, after_attention, ffn_norm, epsilon,
+        ActivationSlot::Norm,
         "resident prefill FFN norm");
     const DeviceMatrix& gate_weight = layer.ffn_gate_weight;
     const DeviceMatrix& up_weight = layer.ffn_up_weight;
     const DeviceMatrix& down_weight = layer.ffn_down_weight;
     const DeviceMatrix gate = encode_matrix_product(
         execution, ffn_input, gate_weight, false, true, nullptr, 1.0f,
+        ActivationSlot::Gate,
         "resident prefill FFN gate projection");
     const DeviceMatrix up = encode_matrix_product(
         execution, ffn_input, up_weight, false, true, nullptr, 1.0f,
+        ActivationSlot::Up,
         "resident prefill FFN up projection");
     const DeviceMatrix activated = encode_binary_matrix(
-        execution, gate, up, swiglu_pipeline, "resident prefill SwiGLU");
+        execution, gate, up, swiglu_pipeline, ActivationSlot::Gate,
+        "resident prefill SwiGLU");
     const DeviceMatrix down = encode_matrix_product(
         execution, activated, down_weight, false, true, nullptr, 1.0f,
+        ActivationSlot::Projection,
         "resident prefill FFN down projection");
     return encode_binary_matrix(
         execution, after_attention, down, residual_pipeline,
+        output_slot,
         "resident prefill FFN residual");
 }
 
@@ -1630,7 +1835,8 @@ MetalLLM::Impl::DeviceVector MetalLLM::Impl::encode_decode_layer(
     id<MTLBuffer> key_cache,
     id<MTLBuffer> value_cache,
     size_t cache_stride,
-    size_t position) const {
+    size_t position,
+    ActivationSlot output_slot) const {
     const size_t q_dimension = layer.attn_q_weight.rows;
     const size_t kv_dimension = layer.attn_k_weight.rows;
     const size_t q_head_count = q_dimension / d_head;
@@ -1649,9 +1855,12 @@ MetalLLM::Impl::DeviceVector MetalLLM::Impl::encode_decode_layer(
     }
     const size_t key_length = position + 1;
 
+    // Decode records the same logical layer as prefill, but all dense linear
+    // projections use GEVM because the query row count is exactly one.
     const DeviceVector& attn_norm = layer.attn_norm_weight;
     const DeviceVector normalized = encode_rmsnorm_vector(
-        execution, hidden, attn_norm, epsilon, "resident decode attention norm");
+        execution, hidden, attn_norm, epsilon, ActivationSlot::Norm,
+        "resident decode attention norm");
 
     const DeviceMatrix& q_weight = layer.attn_q_weight;
     const DeviceVector& q_bias = layer.attn_q_bias;
@@ -1662,18 +1871,23 @@ MetalLLM::Impl::DeviceVector MetalLLM::Impl::encode_decode_layer(
 
     const DeviceVector query = encode_vector_product(
         execution, q_weight, normalized, true, &q_bias, 1.0f,
+        ActivationSlot::Query,
         "resident decode Q projection");
     const DeviceVector key = encode_vector_product(
         execution, k_weight, normalized, true, &k_bias, 1.0f,
+        ActivationSlot::Key,
         "resident decode K projection");
     const DeviceVector value = encode_vector_product(
         execution, v_weight, normalized, true, &v_bias, 1.0f,
+        ActivationSlot::Value,
         "resident decode V projection");
     const DeviceVector rotated_query = encode_rope_heads_vector(
         execution, query, d_head, d_rope, position, theta,
+        ActivationSlot::RotatedQuery,
         "resident decode Q RoPE");
     const DeviceVector rotated_key = encode_rope_heads_vector(
         execution, key, d_head, d_rope, position, theta,
+        ActivationSlot::RotatedKey,
         "resident decode K RoPE");
 
     const DeviceMatrix key_source = {
@@ -1685,56 +1899,74 @@ MetalLLM::Impl::DeviceVector MetalLLM::Impl::encode_decode_layer(
         execution, key_source, value_source, key_cache, value_cache, position,
         "resident decode KV write");
 
-    const DeviceVector attention_output = allocate_device_vector(
-        execution, q_dimension, "resident decode attention output");
+    const DeviceVector attention_output = arena_vector(
+        ActivationSlot::AttentionOutput, q_dimension,
+        "resident decode attention output");
+    const DeviceMatrix attention_output_matrix = {
+        attention_output.buffer, 1, attention_output.length,
+        attention_output.length, attention_output.offset_elements};
     const size_t group_size = q_head_count / kv_head_count;
     for (size_t head = 0; head < q_head_count; ++head) {
         const size_t group = head / group_size;
         const size_t head_offset = checked_elements(
             head, d_head, "Resident decode Q head offset");
         const DeviceMatrix scores = encode_kv_cache_qk(
-            execution, rotated_query.buffer, head_offset, 1, key_length,
+            execution, rotated_query.buffer,
+            rotated_query.offset_elements + head_offset, 1, key_length,
             key_cache, cache_stride, q_dimension, d_head, group, position,
             1.0f / std::sqrt(static_cast<float>(d_head)),
+            ActivationSlot::AttentionScores,
             "resident decode QK");
-        const DeviceVector score_vector = {
-            scores.buffer, key_length, scores.offset_elements};
         const DeviceVector probabilities = encode_softmax_vector(
-            execution, score_vector, "resident decode Softmax");
+            execution,
+            {scores.buffer, key_length, scores.offset_elements},
+            ActivationSlot::AttentionScores,
+            "resident decode Softmax");
         encode_kv_cache_av(
-            execution, probabilities.buffer, value_cache,
-            attention_output.buffer, 1, key_length, cache_stride, key_length,
+            execution,
+            {probabilities.buffer, 1, key_length, key_length,
+             probabilities.offset_elements},
+            value_cache, attention_output_matrix, 1, key_length, cache_stride,
+            key_length,
             d_head, group, q_dimension, head_offset, "resident decode AV");
     }
 
     const DeviceMatrix& output_weight = layer.attn_output_weight;
     const DeviceVector attention_projected = encode_vector_product(
         execution, output_weight, attention_output, true, nullptr, 1.0f,
+        ActivationSlot::Projection,
         "resident decode attention output projection");
     const DeviceVector after_attention = encode_binary_vector(
         execution, hidden, attention_projected, residual_pipeline,
+        output_slot,
         "resident decode attention residual");
 
     const DeviceVector& ffn_norm = layer.ffn_norm_weight;
     const DeviceVector ffn_input = encode_rmsnorm_vector(
         execution, after_attention, ffn_norm, epsilon,
+        ActivationSlot::Norm,
         "resident decode FFN norm");
     const DeviceMatrix& gate_weight = layer.ffn_gate_weight;
     const DeviceMatrix& up_weight = layer.ffn_up_weight;
     const DeviceMatrix& down_weight = layer.ffn_down_weight;
     const DeviceVector gate = encode_vector_product(
         execution, gate_weight, ffn_input, true, nullptr, 1.0f,
+        ActivationSlot::Gate,
         "resident decode FFN gate projection");
     const DeviceVector up = encode_vector_product(
         execution, up_weight, ffn_input, true, nullptr, 1.0f,
+        ActivationSlot::Up,
         "resident decode FFN up projection");
     const DeviceVector activated = encode_binary_vector(
-        execution, gate, up, swiglu_pipeline, "resident decode SwiGLU");
+        execution, gate, up, swiglu_pipeline, ActivationSlot::Gate,
+        "resident decode SwiGLU");
     const DeviceVector down = encode_vector_product(
         execution, down_weight, activated, true, nullptr, 1.0f,
+        ActivationSlot::Projection,
         "resident decode FFN down projection");
     return encode_binary_vector(
         execution, after_attention, down, residual_pipeline,
+        output_slot,
         "resident decode FFN residual");
 }
 
@@ -1765,6 +1997,10 @@ void MetalLLM::Impl::upload_model(
                 }
                 const DeviceMatrix uploaded = upload_matrix(matrix, name);
                 matrices.emplace(&matrix, uploaded);
+                next.weight_bytes = checked_add_size(
+                    next.weight_bytes,
+                    static_cast<size_t>([uploaded.buffer length]),
+                    "Metal weight storage");
                 return uploaded;
             };
         const auto upload_vector_once =
@@ -1775,6 +2011,10 @@ void MetalLLM::Impl::upload_model(
                 }
                 const DeviceVector uploaded = upload_vector(vector, name);
                 vectors.emplace(&vector, uploaded);
+                next.weight_bytes = checked_add_size(
+                    next.weight_bytes,
+                    static_cast<size_t>([uploaded.buffer length]),
+                    "Metal weight storage");
                 return uploaded;
             };
 
@@ -1832,6 +2072,7 @@ void MetalLLM::Impl::allocate_kv_cache(size_t capacity) {
 
     std::vector<KVCacheLayer> next;
     next.reserve(prepared.layers.size());
+    size_t next_kv_cache_bytes = 0;
     @autoreleasepool {
         for (const PreparedLayer& layer : prepared.layers) {
             const size_t kv_dimension = layer.attn_k_weight.rows;
@@ -1844,6 +2085,10 @@ void MetalLLM::Impl::allocate_kv_cache(size_t capacity) {
                 capacity, kv_dimension, "Metal KV-cache allocation");
             const size_t bytes = checked_bytes(
                 elements, "Metal KV-cache allocation");
+            next_kv_cache_bytes = checked_add_size(
+                next_kv_cache_bytes, bytes, "Metal KV-cache allocation");
+            next_kv_cache_bytes = checked_add_size(
+                next_kv_cache_bytes, bytes, "Metal KV-cache allocation");
             KVCacheLayer storage;
             storage.key = [device
                 newBufferWithLength:bytes options:MTLResourceStorageModePrivate];
@@ -1858,8 +2103,35 @@ void MetalLLM::Impl::allocate_kv_cache(size_t capacity) {
         }
     }
     kv_cache = std::move(next);
+    kv_cache_bytes = next_kv_cache_bytes;
     max_sequence = capacity;
     sequence_length = 0;
+}
+
+void MetalLLM::Impl::allocate_activation_arena(size_t capacity) {
+    require_available();
+    if (!prepared.ready || prepared.layers.empty()) {
+        throw std::runtime_error(
+            "Metal weights must be uploaded before allocating activation arena");
+    }
+
+    const ActivationArenaPlan next_plan = make_activation_plan(capacity);
+    const NSUInteger max_buffer_length = [device maxBufferLength];
+    if (max_buffer_length != 0 &&
+        next_plan.bytes > static_cast<size_t>(max_buffer_length)) {
+        throw std::length_error(
+            "Metal activation arena exceeds the device maximum buffer length");
+    }
+
+    id<MTLBuffer> next_buffer = [device
+        newBufferWithLength:next_plan.bytes
+                    options:MTLResourceStorageModePrivate];
+    if (next_buffer == nil) {
+        throw std::runtime_error(
+            "Metal failed to allocate the private activation arena");
+    }
+    activation_plan = next_plan;
+    activation_arena = next_buffer;
 }
 
 void MetalLLM::Impl::load_model(const std::string& gguf_path,
@@ -1904,6 +2176,7 @@ void MetalLLM::Impl::load_model(const std::string& gguf_path,
     upload_model(
         layers, output_weight, token_embedding_weight, output_norm_weight);
     allocate_kv_cache(capacity);
+    allocate_activation_arena(capacity);
 }
 
 MetalLLM::MetalLLM(const std::string& gguf_path,
@@ -1988,7 +2261,8 @@ int32_t MetalLLM::prefill(const std::vector<int32_t>& token_ids) {
             execution, token_ids);
         Impl::DeviceMatrix hidden = impl_->encode_embedding(
             execution, token_buffer, embedding_weight, token_ids.size(),
-            impl_->config.vocabulary_size);
+            impl_->config.vocabulary_size, Impl::ActivationSlot::HiddenA,
+            "resident prefill embedding");
 
         for (size_t layer_index = 0;
              layer_index < impl_->prepared.layers.size();
@@ -2001,7 +2275,10 @@ int32_t MetalLLM::prefill(const std::vector<int32_t>& token_ids) {
                 execution, hidden, layer, impl_->config.norm_epsilon,
                 impl_->config.rotary_dimension, impl_->config.rope_theta,
                 impl_->config.head_size,
-                storage.key, storage.value, storage.kv_dimension, 0);
+                storage.key, storage.value, storage.kv_dimension, 0,
+                layer_index % 2 == 0
+                    ? Impl::ActivationSlot::HiddenB
+                    : Impl::ActivationSlot::HiddenA);
         }
 
         const Impl::DeviceVector& output_norm =
@@ -2009,6 +2286,7 @@ int32_t MetalLLM::prefill(const std::vector<int32_t>& token_ids) {
         const Impl::DeviceMatrix final_norm = impl_->encode_rmsnorm_matrix(
             execution, hidden,
             output_norm, impl_->config.norm_epsilon,
+            Impl::ActivationSlot::Norm,
             "resident prefill final RMSNorm");
         const size_t last_row_offset = checked_elements(
             final_norm.rows - 1, final_norm.stride,
@@ -2020,18 +2298,15 @@ int32_t MetalLLM::prefill(const std::vector<int32_t>& token_ids) {
             impl_->prepared.output_weight;
         const Impl::DeviceVector logits = impl_->encode_vector_product(
             execution, output_weight, last_hidden, true, nullptr, 1.0f,
+            Impl::ActivationSlot::Logits,
             "resident prefill LM head");
         const id<MTLBuffer> token_output = impl_->encode_argmax(
-            execution, logits.buffer, logits.length,
+            execution, logits, logits.length,
             "resident prefill argmax");
 
         impl_->finish_async(execution, "Metal resident prefill");
         const uint32_t token = *static_cast<const uint32_t*>(
             [token_output contents]);
-        // Read the token before making the argmax buffer available to another
-        // execution. The command is complete, but this CPU load still needs the
-        // buffer to remain exclusively owned by this execution.
-        impl_->recycle_temporary_buffers(execution);
         if (token > static_cast<uint32_t>(
                         std::numeric_limits<int32_t>::max())) {
             throw std::overflow_error(
@@ -2078,7 +2353,8 @@ int32_t MetalLLM::decode(int32_t token_id) {
             execution, one_token);
         const Impl::DeviceMatrix embedded = impl_->encode_embedding(
             execution, token_buffer, embedding_weight, 1,
-            impl_->config.vocabulary_size);
+            impl_->config.vocabulary_size, Impl::ActivationSlot::HiddenA,
+            "resident decode embedding");
         Impl::DeviceVector hidden = {
             embedded.buffer, embedded.cols, embedded.offset_elements};
 
@@ -2093,29 +2369,31 @@ int32_t MetalLLM::decode(int32_t token_id) {
                 execution, hidden, layer, impl_->config.norm_epsilon,
                 impl_->config.rotary_dimension, impl_->config.rope_theta,
                 impl_->config.head_size,
-                storage.key, storage.value, storage.kv_dimension, position);
+                storage.key, storage.value, storage.kv_dimension, position,
+                layer_index % 2 == 0
+                    ? Impl::ActivationSlot::HiddenB
+                    : Impl::ActivationSlot::HiddenA);
         }
 
         const Impl::DeviceVector& output_norm =
             impl_->prepared.output_norm_weight;
         const Impl::DeviceVector final_norm = impl_->encode_rmsnorm_vector(
             execution, hidden, output_norm, impl_->config.norm_epsilon,
+            Impl::ActivationSlot::Norm,
             "resident decode final RMSNorm");
         const Impl::DeviceMatrix& output_weight =
             impl_->prepared.output_weight;
         const Impl::DeviceVector logits = impl_->encode_vector_product(
             execution, output_weight, final_norm, true, nullptr, 1.0f,
+            Impl::ActivationSlot::Logits,
             "resident decode LM head");
         const id<MTLBuffer> token_output = impl_->encode_argmax(
-            execution, logits.buffer, logits.length,
+            execution, logits, logits.length,
             "resident decode argmax");
 
         impl_->finish_async(execution, "Metal resident decode");
         const uint32_t token = *static_cast<const uint32_t*>(
             [token_output contents]);
-        // See the corresponding prefill path: consume the result before
-        // returning temporary storage to the shared pool.
-        impl_->recycle_temporary_buffers(execution);
         if (token > static_cast<uint32_t>(
                         std::numeric_limits<int32_t>::max())) {
             throw std::overflow_error(
@@ -2156,6 +2434,18 @@ std::size_t MetalLLM::max_sequence() const noexcept {
 
 bool MetalLLM::uses_gpu() const noexcept {
     return available();
+}
+
+MemoryStats MetalLLM::memory_stats() const noexcept {
+    if (impl_ == nullptr) {
+        return {};
+    }
+    return {
+        static_cast<std::uint64_t>(impl_->prepared.weight_bytes),
+        static_cast<std::uint64_t>(impl_->kv_cache_bytes),
+        static_cast<std::uint64_t>(impl_->activation_plan.bytes),
+        false,
+    };
 }
 
 } // namespace llm

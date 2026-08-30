@@ -1,5 +1,7 @@
 #pragma once
 
+#include "memory_stats.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -184,6 +186,7 @@ public:
     std::size_t position() const noexcept;
     std::size_t max_sequence() const noexcept;
     bool uses_gpu() const noexcept;
+    MemoryStats memory_stats() const noexcept;
 
 private:
     struct Impl;

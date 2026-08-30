@@ -1,5 +1,7 @@
 #pragma once
 
+#include "memory_stats.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -11,9 +13,9 @@ namespace llm {
 struct ModelConfig;
 
 // Complete Metal runtime for one loaded model. The constructor parses GGUF,
-// uploads every model weight, allocates fixed-capacity GPU KV buffers, and then
-// releases the temporary CPU tensors. reset() starts a new conversation while
-// retaining the model and KV allocations.
+// uploads every model weight, allocates fixed-capacity GPU KV buffers and one
+// activation Arena, and then releases the temporary CPU tensors. reset() starts
+// a new conversation while retaining the model and all planned allocations.
 class MetalLLM {
 public:
     explicit MetalLLM(const std::string& gguf_path,
@@ -37,6 +39,7 @@ public:
     std::size_t position() const noexcept;
     std::size_t max_sequence() const noexcept;
     bool uses_gpu() const noexcept;
+    MemoryStats memory_stats() const noexcept;
 
     bool available() const noexcept;
     const std::string& device_name() const noexcept;

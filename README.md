@@ -25,8 +25,14 @@ cpu_llm.h/.cpp    CPU tensors, operators, model ownership, KV cache, inference
 model.h/.cpp      GGUF parser and FP32 dequantization shared by both backends
 metal_llm.h/.mm   Metal model ownership, buffers, graph encoding, and inference
 metal_llm.metal   FP32 Metal kernels
+METAL_INFERENCE.md detailed kernel, threading, command, prefill/decode guide
+memory_stats.h    common weight/KV/intermediate memory accounting interface
 profiler.h/.cpp   CSV timing and logical FLOP/traffic statistics
 ```
+
+See `METAL_INFERENCE.md` for the complete GPU execution walkthrough, including
+per-kernel formulas, thread grids, Qwen2.5 tensor shapes, command-buffer
+construction, and the path from Chat input to generated text.
 
 The GGUF reader and F32/F16/Q5_0/Q8_0/Q4_K/Q6_K dequantizers are private to
 `model.cpp`. This directory does not include source files from its parent
@@ -75,6 +81,7 @@ Options:
 
 ```text
 --tokens N       Maximum generated tokens per input, default 32
+--max-sequence N Fixed activation/KV capacity; defaults to model context
 --system TEXT    Replace the default ChatML system message
 --raw            Tokenize input directly without ChatML wrapping
 --gpu            Require the Metal backend; never fall back to CPU
@@ -95,6 +102,7 @@ make run TOKENS=4
 make run MODEL=/path/to/model.gguf TOKENS=8
 make run RAW=1 TOKENS=4
 make run GPU=1 TOKENS=4
+make run MAX_SEQUENCE=2048 TOKENS=4
 make run PROFILE_CSV=qwen-profile.csv TOKENS=1
 make run NO_PROFILE=1 TOKENS=1
 ```
@@ -133,7 +141,24 @@ length.
 One command buffer contains the complete prefill or decode graph. Kernel output
 buffers are bound directly as following kernel inputs. Only token IDs enter
 from CPU and one four-byte greedy argmax token ID returns after completion.
-Transient activation buffers are recycled through a bounded pool.
+
+The Metal backend also allocates one private activation Arena during model
+initialization. Its slots are planned once for `max_sequence` and reused by
+prefill/decode and by alternating transformer layers; inference does not create
+an activation `MTLBuffer` for each operator. The Arena includes one
+`[max_sequence, max_sequence]` FP32 score/probability slot because the current
+attention implementation materializes scores before Softmax. Consequently, a
+large `--max-sequence` can require several GiB even before weights and KV Cache
+are counted. Use a smaller capacity for experiments, subject to the model's
+context limit.
+
+At the end of every turn Chat prints `weight_bytes`, `kv_cache_bytes`,
+`intermediate_bytes`, and their sum as `peak_memory_bytes`. For Metal,
+`intermediate_bytes` is the actual preallocated Arena size and
+`kv_cache_bytes` is the actual private allocation. For CPU, the KV value is the
+current FP32 cache payload and the intermediate value is a shape-based estimate
+(`intermediate_kind=estimated`), because the reference CPU path does not use a
+single Arena allocator.
 
 ## Inference path
 
@@ -172,8 +197,8 @@ synchronization, and the final token readback. FLOPs and byte counts are logical
 shape-derived estimates, not hardware performance counters.
 
 At the end of each input turn, Chat writes prompt token count, generated token
-count, prefill latency, aggregate decode latency, and tokens per second to
-`stderr`.
+count, prefill latency, aggregate decode latency, tokens per second, and the
+four memory fields to `stderr`.
 
 ## Metal access
 

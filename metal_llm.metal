@@ -308,6 +308,9 @@ kernel void metal_softmax_f32(
     }
 }
 
+// Flat elementwise dispatch: thread `index` owns one [row, ffn_col] element.
+// There is no communication between threads. The branch keeps sigmoid stable
+// for large negative gate values.
 kernel void metal_swiglu_f32(
         device const float * gate [[buffer(0)]],
         device const float * up [[buffer(1)]],
@@ -326,6 +329,7 @@ kernel void metal_swiglu_f32(
     output[index] = gate_value * sigmoid * up[index];
 }
 
+// Flat elementwise dispatch: one thread performs one FP32 residual addition.
 kernel void metal_residual_f32(
         device const float * left [[buffer(0)]],
         device const float * right [[buffer(1)]],
@@ -465,6 +469,9 @@ kernel void metal_kv_cache_av_f32(
     output[output_index] = accumulator;
 }
 
+// Embedding is a gather expressed as a flat copy. One thread owns one output
+// scalar; all embedding columns belonging to one token read the same token id
+// and contiguous values from that token's [vocabulary, hidden] weight row.
 kernel void metal_embedding_f32(
         device const int * token_ids [[buffer(0)]],
         device const float * embedding [[buffer(1)]],
@@ -488,7 +495,10 @@ kernel void metal_embedding_f32(
 }
 
 // Greedy selection is kept on the device so a generation step returns only a
-// four-byte token id instead of the complete vocabulary logits.
+// four-byte token id instead of the complete vocabulary logits. This baseline
+// implementation intentionally launches one thread, which scans the whole
+// vocabulary serially; a production implementation would use a parallel
+// multi-stage reduction.
 kernel void metal_argmax_f32(
         device const float * input [[buffer(0)]],
         device uint * output [[buffer(1)]],

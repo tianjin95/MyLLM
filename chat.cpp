@@ -494,6 +494,7 @@ private:
 struct Options {
     std::string model_path;
     int max_new_tokens = 32;
+    std::size_t max_sequence = 0;
     bool raw_prompt = false;
     bool use_gpu = false;
     bool help_requested = false;
@@ -505,6 +506,7 @@ struct Options {
 void usage(const char * program) {
     std::cerr << "Usage: " << program << " --model MODEL.gguf [options]\n"
               << "  --tokens N       Maximum generated tokens per input, default 32\n"
+              << "  --max-sequence N Maximum model sequence capacity (default model context)\n"
               << "  --system TEXT    System message used by ChatML\n"
               << "  --raw            Send input directly without ChatML wrapping\n"
               << "  --gpu            Use the Metal GPU backend (no CPU fallback)\n"
@@ -559,6 +561,15 @@ bool parse_options(int argc, char ** argv, Options & options) {
             options.model_path = value("--model");
         } else if (argument == "--tokens") {
             options.max_new_tokens = std::stoi(value("--tokens"));
+        } else if (argument == "--max-sequence") {
+            const unsigned long long parsed = std::stoull(
+                value("--max-sequence"));
+            if (parsed > static_cast<unsigned long long>(
+                              std::numeric_limits<std::size_t>::max())) {
+                throw std::out_of_range(
+                    "--max-sequence does not fit in size_t");
+            }
+            options.max_sequence = static_cast<std::size_t>(parsed);
         } else if (argument == "--system") {
             options.system_prompt = value("--system");
         } else if (argument == "--raw") {
@@ -671,6 +682,10 @@ double tokens_per_second(size_t tokens, double milliseconds) {
     return static_cast<double>(tokens) * 1000.0 / milliseconds;
 }
 
+double bytes_to_mib(std::uint64_t bytes) {
+    return static_cast<double>(bytes) / (1024.0 * 1024.0);
+}
+
 void print_generation_stats(const GenerationStats & stats) {
     std::cerr << std::fixed << std::setprecision(3)
               << "[chat] generation_stats mode="
@@ -685,6 +700,17 @@ void print_generation_stats(const GenerationStats & stats) {
               << " decode_tokens_per_sec="
               << tokens_per_second(stats.decode_steps, stats.decode_ms)
               << " total_ms=" << stats.total_ms
+              << " weight_bytes=" << stats.memory.weight_bytes
+              << " weight_mib=" << bytes_to_mib(stats.memory.weight_bytes)
+              << " kv_cache_bytes=" << stats.memory.kv_cache_bytes
+              << " kv_cache_mib=" << bytes_to_mib(stats.memory.kv_cache_bytes)
+              << " intermediate_bytes=" << stats.memory.intermediate_bytes
+              << " intermediate_mib="
+              << bytes_to_mib(stats.memory.intermediate_bytes)
+              << " intermediate_kind="
+              << (stats.memory.intermediate_is_estimate ? "estimated" : "arena")
+              << " peak_memory_bytes=" << stats.memory.total_bytes()
+              << " peak_memory_mib=" << bytes_to_mib(stats.memory.total_bytes())
               << " stopped=" << (stats.stopped ? "true" : "false")
               << '\n';
 }
@@ -718,6 +744,7 @@ void run_turn(const Options & options,
         backend, sequence, static_cast<size_t>(options.max_new_tokens),
         stop_token_ids, token_sink);
     std::cout << '\n';
+    std::cout.flush();
     print_generation_stats(result.stats);
 }
 
@@ -765,6 +792,7 @@ GenerationResult generate(Backend & backend,
     }
 
     result.stats.total_ms = elapsed_ms(total_begin, Clock::now());
+    result.stats.memory = backend.memory_stats();
     return result;
 }
 
@@ -859,10 +887,10 @@ int run_cli(int argc, char ** argv) {
 
         std::cerr << "[chat] loading model: " << options.model_path << "\n";
         if (options.use_gpu) {
-            llm::MetalLLM backend(options.model_path);
+            llm::MetalLLM backend(options.model_path, options.max_sequence);
             return run_interactive(options, backend);
         }
-        llm::CPULLM backend(options.model_path);
+        llm::CPULLM backend(options.model_path, options.max_sequence);
         return run_interactive(options, backend);
     } catch (const std::exception & error) {
         std::cerr << "chat: " << error.what() << "\n";

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "memory_stats.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -29,6 +31,7 @@ struct GenerationStats {
     std::size_t decode_steps = 0;
     bool used_gpu = false;
     bool stopped = false;
+    llm::MemoryStats memory;
 };
 
 struct GenerationResult {

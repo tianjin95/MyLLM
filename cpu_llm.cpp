@@ -47,6 +47,55 @@ int32_t greedy_token(const Vector& logits) {
     return static_cast<int32_t>(token);
 }
 
+uint64_t saturating_add_bytes(uint64_t left, uint64_t right) {
+    if (right > std::numeric_limits<uint64_t>::max() - left) {
+        return std::numeric_limits<uint64_t>::max();
+    }
+    return left + right;
+}
+
+uint64_t saturating_mul_bytes(uint64_t left, uint64_t right) {
+    if (left != 0 && right > std::numeric_limits<uint64_t>::max() / left) {
+        return std::numeric_limits<uint64_t>::max();
+    }
+    return left * right;
+}
+
+uint64_t tensor_bytes(size_t rows, size_t cols) {
+    return saturating_mul_bytes(
+        saturating_mul_bytes(static_cast<uint64_t>(rows),
+                             static_cast<uint64_t>(cols)),
+        sizeof(float));
+}
+
+uint64_t estimate_activation_bytes(const ModelConfig& config,
+                                   size_t max_sequence) {
+    const size_t query = config.attention_head_count * config.head_size;
+    const size_t key_value = config.kv_head_count * config.head_size;
+    uint64_t result = 0;
+    const auto add = [&](uint64_t bytes) {
+        result = saturating_add_bytes(result, bytes);
+    };
+
+    // This mirrors the Metal arena's slot layout. CPU does not use this
+    // arena, so the value is a shape-based live-activation estimate.
+    add(tensor_bytes(max_sequence, config.embedding_size)); // hidden A
+    add(tensor_bytes(max_sequence, config.embedding_size)); // hidden B
+    add(tensor_bytes(max_sequence, config.embedding_size)); // norm
+    add(tensor_bytes(max_sequence, query));                 // Q
+    add(tensor_bytes(max_sequence, query));                 // rotated Q
+    add(tensor_bytes(max_sequence, key_value));             // K
+    add(tensor_bytes(max_sequence, key_value));             // rotated K
+    add(tensor_bytes(max_sequence, key_value));             // V
+    add(tensor_bytes(max_sequence, query));                 // attention output
+    add(tensor_bytes(max_sequence, max_sequence));         // score/probability
+    add(tensor_bytes(max_sequence, config.embedding_size)); // projection
+    add(tensor_bytes(max_sequence, config.feed_forward_size)); // gate
+    add(tensor_bytes(max_sequence, config.feed_forward_size)); // up
+    add(tensor_bytes(config.vocabulary_size, 1));           // logits
+    return result;
+}
+
 } // namespace
 
 Matrix embedding(const std::vector<int32_t>& token_ids,
@@ -1053,6 +1102,27 @@ std::size_t CPULLM::max_sequence() const noexcept {
 
 bool CPULLM::uses_gpu() const noexcept {
     return false;
+}
+
+MemoryStats CPULLM::memory_stats() const noexcept {
+    if (impl_ == nullptr) {
+        return {};
+    }
+
+    uint64_t kv_cache_bytes = 0;
+    for (const CPUKVCache& cache : impl_->kv_cache) {
+        const uint64_t layer_bytes = saturating_add_bytes(
+            tensor_bytes(cache.key.rows, cache.key.cols),
+            tensor_bytes(cache.value.rows, cache.value.cols));
+        kv_cache_bytes = saturating_add_bytes(kv_cache_bytes, layer_bytes);
+    }
+
+    return {
+        static_cast<uint64_t>(impl_->config.dequantized_bytes),
+        kv_cache_bytes,
+        estimate_activation_bytes(impl_->config, impl_->max_sequence),
+        true,
+    };
 }
 
 } // namespace llm
