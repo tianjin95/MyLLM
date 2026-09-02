@@ -15,6 +15,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -499,6 +500,7 @@ struct Options {
     bool use_gpu = false;
     bool help_requested = false;
     bool profiling_enabled = true;
+    bool metal_kernel_profile = false;
     std::string profile_csv_path = "llm_profile.csv";
     std::string system_prompt = "You are a concise and helpful assistant.";
 };
@@ -513,6 +515,9 @@ void usage(const char * program) {
               << "  --profile-csv P  Write timing/statistics CSV under output/\n"
               << "                   (default output/llm_profile.csv)\n"
               << "  --profile-log P  Compatibility alias for --profile-csv\n"
+              << "  --metal-kernel-profile\n"
+              << "                   Record per-kernel Metal GPU timestamps\n"
+              << "                   (diagnostic mode; may perturb scheduling)\n"
               << "  --no-profile     Disable timing/statistics collection\n"
               << "  --help           Show this help\n";
 }
@@ -581,6 +586,8 @@ bool parse_options(int argc, char ** argv, Options & options) {
         } else if (argument == "--profile-log") {
             // Keep existing scripts working; the selected file is still CSV.
             options.profile_csv_path = value("--profile-log");
+        } else if (argument == "--metal-kernel-profile") {
+            options.metal_kernel_profile = true;
         } else if (argument == "--no-profile") {
             options.profiling_enabled = false;
         } else if (argument == "--help" || argument == "-h") {
@@ -636,7 +643,7 @@ void validate_generation_request(
         throw std::invalid_argument(
             "Initial token sequence leaves no room for generated tokens");
     }
-    const llm::ModelConfig & config = backend.config();
+    const auto & config = backend.config();
     if (config.layer_count == 0 || config.vocabulary_size == 0 ||
         config.context_length == 0) {
         throw std::runtime_error("Backend model metadata is incomplete");
@@ -656,7 +663,7 @@ std::vector<int32_t> make_stop_tokens(const QwenTokenizer & tokenizer,
                                       const Backend & backend,
                                       int32_t im_end,
                                       int32_t slash_s) {
-    const llm::ModelConfig & config = backend.config();
+    const auto & config = backend.config();
     std::vector<int32_t> result;
     auto add = [&](int32_t token) {
         if (token >= 0 && !contains_token(result, token)) result.push_back(token);
@@ -807,11 +814,29 @@ std::string backend_description(const llm::MetalLLM & backend) {
 template <typename Backend>
 int run_interactive(const Options & options, Backend & backend) {
     if (options.profiling_enabled) {
-        backend.enable_profiling(options.profile_csv_path);
+        if constexpr (std::is_same_v<Backend, llm::MetalLLM>) {
+            backend.enable_profiling(
+                options.profile_csv_path, options.metal_kernel_profile);
+        } else {
+            backend.enable_profiling(options.profile_csv_path);
+        }
         std::cerr << "[chat] profile_csv=" << options.profile_csv_path << "\n";
+        if constexpr (std::is_same_v<Backend, llm::MetalLLM>) {
+            const std::filesystem::path primary(options.profile_csv_path);
+            const std::filesystem::path parent = primary.parent_path();
+            const std::string stem = primary.stem().empty()
+                ? "llm_profile" : primary.stem().string();
+            std::cerr << "[chat] metal_command_csv="
+                      << (parent / (stem + "_metal_commands.csv")).string()
+                      << "\n[chat] metal_kernel_csv="
+                      << (parent / (stem + "_metal_kernels.csv")).string()
+                      << "\n[chat] metal_operation_csv="
+                      << (parent / (stem + "_metal_ops.csv")).string()
+                      << "\n";
+        }
     }
 
-    const llm::ModelConfig & config = backend.config();
+    const auto & config = backend.config();
     if (config.vocabulary.empty() || config.merges.empty()) {
         throw std::runtime_error(
             "model does not contain Qwen tokenizer vocabulary/merges");
@@ -879,6 +904,15 @@ int run_cli(int argc, char ** argv) {
         Options options;
         if (!parse_options(argc, argv, options)) return 1;
         if (options.help_requested) return 0;
+
+        if (options.metal_kernel_profile && !options.use_gpu) {
+            throw std::invalid_argument(
+                "--metal-kernel-profile requires --gpu");
+        }
+        if (options.metal_kernel_profile && !options.profiling_enabled) {
+            throw std::invalid_argument(
+                "--metal-kernel-profile cannot be combined with --no-profile");
+        }
 
         if (options.profiling_enabled) {
             options.profile_csv_path = prepare_profile_output_path(

@@ -1,9 +1,14 @@
 #include "profiler.h"
 
 #include <cmath>
+#include <algorithm>
+#include <filesystem>
 #include <iomanip>
 #include <limits>
+#include <map>
+#include <numeric>
 #include <stdexcept>
+#include <tuple>
 #include <utility>
 
 namespace llm {
@@ -39,7 +44,416 @@ uint64_t matrix_allocations(size_t rows) {
     return saturating_add(to_u64(rows), 1);
 }
 
+std::string csv_escape_value(const std::string& value) {
+    std::string escaped;
+    escaped.reserve(value.size() + 2);
+    escaped.push_back('"');
+    for (const char character : value) {
+        if (character == '"') {
+            escaped.push_back('"');
+        }
+        escaped.push_back(character);
+    }
+    escaped.push_back('"');
+    return escaped;
+}
+
+std::string derived_profile_path(const std::string& primary_path,
+                                 const char* suffix) {
+    namespace fs = std::filesystem;
+    const fs::path primary(primary_path);
+    const fs::path parent = primary.parent_path();
+    std::string stem = primary.stem().string();
+    if (stem.empty()) {
+        stem = "llm_profile";
+    }
+    return (parent / (stem + suffix + ".csv")).string();
+}
+
+double ns_to_ms(uint64_t nanoseconds) {
+    return static_cast<double>(nanoseconds) / 1.0e6;
+}
+
+double ns_to_us(double nanoseconds) {
+    return nanoseconds / 1.0e3;
+}
+
+void write_optional(std::ostream& output,
+                    const std::optional<double>& value,
+                    int precision = 6) {
+    if (value.has_value() && std::isfinite(*value)) {
+        output << std::fixed << std::setprecision(precision) << *value;
+    }
+}
+
+std::optional<double> kernel_duration_ns(
+    const MetalKernelProfileRecord& kernel,
+    double timestamp_ns_per_tick) {
+    if (!kernel.timestamp_valid || timestamp_ns_per_tick <= 0.0 ||
+        kernel.end_timestamp < kernel.start_timestamp) {
+        return std::nullopt;
+    }
+    return static_cast<double>(
+               kernel.end_timestamp - kernel.start_timestamp) *
+           timestamp_ns_per_tick;
+}
+
+double percentile(std::vector<double> values, double fraction) {
+    if (values.empty()) {
+        return 0.0;
+    }
+    std::sort(values.begin(), values.end());
+    const double position = fraction * static_cast<double>(values.size() - 1);
+    const size_t lower = static_cast<size_t>(position);
+    const size_t upper = std::min(values.size() - 1, lower + 1);
+    const double weight = position - static_cast<double>(lower);
+    return values[lower] * (1.0 - weight) + values[upper] * weight;
+}
+
+struct MetalOperationAggregate {
+    uint64_t calls = 0;
+    double gpu_ns = 0.0;
+    double gap_before_ns = 0.0;
+    uint64_t cpu_encode_ns = 0;
+    ProfileMetrics metrics;
+    uint64_t weight_bytes = 0;
+    uint64_t shader_read_bytes = 0;
+    double minimum_kernel_ns = std::numeric_limits<double>::infinity();
+    double maximum_kernel_ns = 0.0;
+};
+
 } // namespace
+
+MetalProfiler::MetalProfiler(const std::string& primary_csv_path,
+                             bool detailed_kernel_timestamps)
+    : command_csv_path_(derived_profile_path(
+          primary_csv_path, "_metal_commands")),
+      kernel_csv_path_(derived_profile_path(
+          primary_csv_path, "_metal_kernels")),
+      operation_csv_path_(derived_profile_path(
+          primary_csv_path, "_metal_ops")),
+      detailed_kernel_timestamps_(detailed_kernel_timestamps) {
+    command_output_.open(command_csv_path_, std::ios::out | std::ios::trunc);
+    kernel_output_.open(kernel_csv_path_, std::ios::out | std::ios::trunc);
+    operation_output_.open(
+        operation_csv_path_, std::ios::out | std::ios::trunc);
+    if (!command_output_ || !kernel_output_ || !operation_output_) {
+        throw std::runtime_error(
+            "Cannot open one or more Metal profile CSV files");
+    }
+
+    command_output_
+        << "command_index,phase,sequence_tokens,kernel_count,threadgroups,"
+           "dispatched_threads,single_threadgroup_kernels,counter_requested,"
+           "counter_active,counter_status,sample_count,timestamp_ns_per_tick,"
+           "cpu_command_create_ms,cpu_encode_ms,cpu_encoder_sum_ms,"
+           "cpu_encode_unattributed_ms,cpu_commit_ms,cpu_wait_ms,"
+           "cpu_counter_resolve_ms,cpu_total_ms,"
+           "commit_to_scheduled_callback_ms,"
+           "commit_to_completed_callback_ms,"
+           "completed_callback_to_wait_return_ms,"
+           "commit_to_gpu_start_ms,gpu_start_to_kernel_start_ms,"
+           "kernel_window_ms,kernel_end_to_gpu_end_ms,gpu_duration_ms,"
+           "gpu_end_to_wait_return_ms,sampled_kernel_ms,sampled_gap_ms,"
+           "sampled_span_ms,sampled_unattributed_ms,kernel_p50_us,"
+           "kernel_p90_us,kernel_p99_us,kernel_max_us,kernel_max_operation\n";
+    kernel_output_
+        << "command_index,phase,sequence_tokens,order,layer_index,head_index,"
+           "operation,pipeline,value_type,m,n,k,dispatch_type,grid_x,grid_y,"
+           "grid_z,threads_x,threads_y,threads_z,threadgroups,"
+           "dispatched_threads,cpu_encode_us,start_timestamp,end_timestamp,"
+           "gpu_duration_us,gap_from_previous_us,flops,read_bytes,"
+           "write_bytes,weight_bytes,shader_read_bytes,gflops,"
+           "minimum_gbps,weight_gbps,shader_requested_gbps\n";
+    operation_output_
+        << "command_index,phase,sequence_tokens,operation,pipeline,value_type,"
+           "calls,gpu_time_ms,gpu_percent,average_us,min_us,max_us,"
+           "gap_before_ms,cpu_encode_ms,flops,read_bytes,write_bytes,"
+           "weight_bytes,shader_read_bytes,gflops,minimum_gbps,"
+           "weight_gbps,shader_requested_gbps\n";
+}
+
+MetalProfiler::~MetalProfiler() {
+    flush();
+}
+
+size_t MetalProfiler::acquire_command_index() noexcept {
+    return next_command_index_++;
+}
+
+bool MetalProfiler::detailed_kernel_timestamps() const noexcept {
+    return detailed_kernel_timestamps_;
+}
+
+const std::string& MetalProfiler::command_csv_path() const noexcept {
+    return command_csv_path_;
+}
+
+const std::string& MetalProfiler::kernel_csv_path() const noexcept {
+    return kernel_csv_path_;
+}
+
+const std::string& MetalProfiler::operation_csv_path() const noexcept {
+    return operation_csv_path_;
+}
+
+void MetalProfiler::write(
+    MetalCommandProfileRecord command,
+    const std::vector<MetalKernelProfileRecord>& kernels) {
+    double sampled_kernel_ns = 0.0;
+    double sampled_gap_ns = 0.0;
+    double sampled_span_ns = 0.0;
+    uint64_t cpu_encoder_sum_ns = 0;
+    std::vector<double> durations;
+    std::string maximum_operation;
+    double maximum_duration_ns = 0.0;
+    std::map<std::tuple<std::string, std::string, std::string>,
+             MetalOperationAggregate> operations;
+
+    uint64_t first_timestamp = 0;
+    uint64_t previous_end_timestamp = 0;
+    uint64_t last_timestamp = 0;
+    bool have_timestamp_span = false;
+
+    for (const MetalKernelProfileRecord& kernel : kernels) {
+        cpu_encoder_sum_ns = saturating_add(
+            cpu_encoder_sum_ns, kernel.cpu_encode_ns);
+        const std::optional<double> duration = kernel_duration_ns(
+            kernel, command.timestamp_ns_per_tick);
+        std::optional<double> gap;
+        if (kernel.timestamp_valid && command.timestamp_ns_per_tick > 0.0) {
+            if (!have_timestamp_span) {
+                first_timestamp = kernel.start_timestamp;
+                have_timestamp_span = true;
+            } else if (kernel.start_timestamp >= previous_end_timestamp) {
+                gap = static_cast<double>(
+                          kernel.start_timestamp - previous_end_timestamp) *
+                      command.timestamp_ns_per_tick;
+                sampled_gap_ns += *gap;
+            }
+            previous_end_timestamp = kernel.end_timestamp;
+            last_timestamp = kernel.end_timestamp;
+        }
+        if (duration.has_value()) {
+            sampled_kernel_ns += *duration;
+            durations.push_back(*duration);
+            if (*duration > maximum_duration_ns) {
+                maximum_duration_ns = *duration;
+                maximum_operation = kernel.operation;
+            }
+        }
+
+        const auto key = std::make_tuple(
+            kernel.operation, kernel.pipeline, kernel.value_type);
+        MetalOperationAggregate& aggregate = operations[key];
+        aggregate.calls = saturating_add(aggregate.calls, 1);
+        aggregate.cpu_encode_ns = saturating_add(
+            aggregate.cpu_encode_ns, kernel.cpu_encode_ns);
+        aggregate.metrics += kernel.metrics;
+        aggregate.weight_bytes = saturating_add(
+            aggregate.weight_bytes, kernel.weight_bytes);
+        aggregate.shader_read_bytes = saturating_add(
+            aggregate.shader_read_bytes, kernel.shader_read_bytes);
+        if (duration.has_value()) {
+            aggregate.gpu_ns += *duration;
+            aggregate.minimum_kernel_ns = std::min(
+                aggregate.minimum_kernel_ns, *duration);
+            aggregate.maximum_kernel_ns = std::max(
+                aggregate.maximum_kernel_ns, *duration);
+        }
+        if (gap.has_value()) {
+            aggregate.gap_before_ns += *gap;
+        }
+
+        kernel_output_ << command.command_index << ','
+                       << csv_escape_value(command.phase) << ','
+                       << command.sequence_tokens << ',' << kernel.order << ',';
+        if (kernel.layer_index.has_value()) {
+            kernel_output_ << *kernel.layer_index;
+        }
+        kernel_output_ << ',';
+        if (kernel.head_index.has_value()) {
+            kernel_output_ << *kernel.head_index;
+        }
+        kernel_output_ << ',' << csv_escape_value(kernel.operation)
+                       << ',' << csv_escape_value(kernel.pipeline)
+                       << ',' << csv_escape_value(kernel.value_type)
+                       << ',' << kernel.m << ',' << kernel.n << ',' << kernel.k
+                       << ',' << csv_escape_value(kernel.dispatch_type)
+                       << ',' << kernel.grid_x << ',' << kernel.grid_y
+                       << ',' << kernel.grid_z << ',' << kernel.threads_x
+                       << ',' << kernel.threads_y << ',' << kernel.threads_z
+                       << ',' << kernel.threadgroups
+                       << ',' << kernel.dispatched_threads
+                       << ',' << std::fixed << std::setprecision(3)
+                       << ns_to_us(static_cast<double>(kernel.cpu_encode_ns))
+                       << ',';
+        if (kernel.timestamp_valid) {
+            kernel_output_ << kernel.start_timestamp;
+        }
+        kernel_output_ << ',';
+        if (kernel.timestamp_valid) {
+            kernel_output_ << kernel.end_timestamp;
+        }
+        kernel_output_ << ',';
+        if (duration.has_value()) {
+            kernel_output_ << ns_to_us(*duration);
+        }
+        kernel_output_ << ',';
+        if (gap.has_value()) {
+            kernel_output_ << ns_to_us(*gap);
+        }
+        kernel_output_ << ',' << kernel.metrics.flops
+                       << ',' << kernel.metrics.read_bytes
+                       << ',' << kernel.metrics.write_bytes
+                       << ',' << kernel.weight_bytes
+                       << ',' << kernel.shader_read_bytes << ',';
+        const double seconds = duration.has_value() ? *duration / 1.0e9 : 0.0;
+        if (seconds > 0.0) {
+            kernel_output_ << std::setprecision(3)
+                           << static_cast<double>(kernel.metrics.flops) /
+                                  seconds / 1.0e9
+                           << ','
+                           << static_cast<double>(saturating_add(
+                                  kernel.metrics.read_bytes,
+                                  kernel.metrics.write_bytes)) /
+                                  seconds / 1.0e9
+                           << ','
+                           << static_cast<double>(kernel.weight_bytes) /
+                                  seconds / 1.0e9
+                           << ','
+                           << static_cast<double>(kernel.shader_read_bytes) /
+                                  seconds / 1.0e9;
+        } else {
+            kernel_output_ << ",,,";
+        }
+        kernel_output_ << '\n';
+    }
+
+    if (have_timestamp_span && last_timestamp >= first_timestamp) {
+        sampled_span_ns = static_cast<double>(
+                              last_timestamp - first_timestamp) *
+                          command.timestamp_ns_per_tick;
+    }
+    const double sampled_unattributed_ns =
+        command.gpu_duration_ms.has_value()
+            ? *command.gpu_duration_ms * 1.0e6 - sampled_span_ns
+            : 0.0;
+    const uint64_t encode_unattributed_ns = command.cpu_encode_ns >=
+            cpu_encoder_sum_ns
+        ? command.cpu_encode_ns - cpu_encoder_sum_ns
+        : 0;
+
+    command_output_ << command.command_index << ','
+                    << csv_escape_value(command.phase) << ','
+                    << command.sequence_tokens << ',' << command.kernel_count
+                    << ',' << command.threadgroup_count
+                    << ',' << command.dispatched_threads
+                    << ',' << command.single_threadgroup_kernels
+                    << ',' << (command.counter_requested ? 1 : 0)
+                    << ',' << (command.counter_active ? 1 : 0)
+                    << ',' << csv_escape_value(command.counter_status)
+                    << ',' << command.sample_count
+                    << ',' << std::fixed << std::setprecision(9)
+                    << command.timestamp_ns_per_tick
+                    << ',' << std::setprecision(6)
+                    << ns_to_ms(command.cpu_command_create_ns)
+                    << ',' << ns_to_ms(command.cpu_encode_ns)
+                    << ',' << ns_to_ms(cpu_encoder_sum_ns)
+                    << ',' << ns_to_ms(encode_unattributed_ns)
+                    << ',' << ns_to_ms(command.cpu_commit_ns)
+                    << ',' << ns_to_ms(command.cpu_wait_ns)
+                    << ',' << ns_to_ms(command.cpu_counter_resolve_ns)
+                    << ',' << ns_to_ms(command.cpu_total_ns) << ',';
+    write_optional(
+        command_output_, command.commit_to_scheduled_callback_ms);
+    command_output_ << ',';
+    write_optional(
+        command_output_, command.commit_to_completed_callback_ms);
+    command_output_ << ',';
+    write_optional(
+        command_output_, command.completed_callback_to_wait_return_ms);
+    command_output_ << ',';
+    write_optional(command_output_, command.commit_to_gpu_start_ms);
+    command_output_ << ',';
+    write_optional(command_output_, command.gpu_start_to_kernel_start_ms);
+    command_output_ << ',';
+    write_optional(command_output_, command.kernel_window_ms);
+    command_output_ << ',';
+    write_optional(command_output_, command.kernel_end_to_gpu_end_ms);
+    command_output_ << ',';
+    write_optional(command_output_, command.gpu_duration_ms);
+    command_output_ << ',';
+    write_optional(command_output_, command.gpu_end_to_wait_return_ms);
+    command_output_ << ',' << sampled_kernel_ns / 1.0e6
+                    << ',' << sampled_gap_ns / 1.0e6
+                    << ',' << sampled_span_ns / 1.0e6
+                    << ',' << sampled_unattributed_ns / 1.0e6
+                    << ',' << ns_to_us(percentile(durations, 0.50))
+                    << ',' << ns_to_us(percentile(durations, 0.90))
+                    << ',' << ns_to_us(percentile(durations, 0.99))
+                    << ',' << ns_to_us(maximum_duration_ns)
+                    << ',' << csv_escape_value(maximum_operation) << '\n';
+
+    for (const auto& entry : operations) {
+        const auto& key = entry.first;
+        const MetalOperationAggregate& aggregate = entry.second;
+        const double seconds = aggregate.gpu_ns / 1.0e9;
+        const uint64_t minimum_bytes = saturating_add(
+            aggregate.metrics.read_bytes, aggregate.metrics.write_bytes);
+        operation_output_ << command.command_index << ','
+                          << csv_escape_value(command.phase) << ','
+                          << command.sequence_tokens << ','
+                          << csv_escape_value(std::get<0>(key)) << ','
+                          << csv_escape_value(std::get<1>(key)) << ','
+                          << csv_escape_value(std::get<2>(key)) << ','
+                          << aggregate.calls << ',' << std::fixed
+                          << std::setprecision(6)
+                          << aggregate.gpu_ns / 1.0e6 << ','
+                          << (sampled_kernel_ns > 0.0
+                                  ? aggregate.gpu_ns / sampled_kernel_ns * 100.0
+                                  : 0.0)
+                          << ','
+                          << (aggregate.calls != 0
+                                  ? aggregate.gpu_ns /
+                                        static_cast<double>(aggregate.calls) /
+                                        1.0e3
+                                  : 0.0)
+                          << ','
+                          << (std::isfinite(aggregate.minimum_kernel_ns)
+                                  ? aggregate.minimum_kernel_ns / 1.0e3
+                                  : 0.0)
+                          << ',' << aggregate.maximum_kernel_ns / 1.0e3
+                          << ',' << aggregate.gap_before_ns / 1.0e6
+                          << ',' << ns_to_ms(aggregate.cpu_encode_ns)
+                          << ',' << aggregate.metrics.flops
+                          << ',' << aggregate.metrics.read_bytes
+                          << ',' << aggregate.metrics.write_bytes
+                          << ',' << aggregate.weight_bytes
+                          << ',' << aggregate.shader_read_bytes << ',';
+        if (seconds > 0.0) {
+            operation_output_
+                << static_cast<double>(aggregate.metrics.flops) /
+                       seconds / 1.0e9
+                << ',' << static_cast<double>(minimum_bytes) /
+                       seconds / 1.0e9
+                << ',' << static_cast<double>(aggregate.weight_bytes) /
+                       seconds / 1.0e9
+                << ',' << static_cast<double>(aggregate.shader_read_bytes) /
+                       seconds / 1.0e9;
+        } else {
+            operation_output_ << ",,,";
+        }
+        operation_output_ << '\n';
+    }
+    flush();
+}
+
+void MetalProfiler::flush() {
+    command_output_.flush();
+    kernel_output_.flush();
+    operation_output_.flush();
+}
 
 ProfileMetrics operator+(ProfileMetrics left, const ProfileMetrics& right) {
     left += right;

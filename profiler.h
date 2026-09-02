@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <optional>
 #include <string>
@@ -25,6 +26,99 @@ struct ProfileMetrics {
     // denominator used for estimated_gbps and arithmetic_intensity.
     uint64_t temporary_bytes = 0;
     uint64_t allocations = 0;
+};
+
+// Hardware-facing Metal records are kept separate from the generic operator
+// profiler. The command record is inexpensive and is emitted for every Metal
+// forward. Kernel records are populated only by the opt-in counter mode.
+struct MetalKernelProfileRecord {
+    size_t order = 0;
+    std::optional<size_t> layer_index;
+    std::optional<size_t> head_index;
+    std::string operation;
+    std::string pipeline;
+    std::string value_type;
+    std::string dispatch_type;
+    size_t m = 0;
+    size_t n = 0;
+    size_t k = 0;
+    uint64_t grid_x = 0;
+    uint64_t grid_y = 0;
+    uint64_t grid_z = 0;
+    uint64_t threads_x = 0;
+    uint64_t threads_y = 0;
+    uint64_t threads_z = 0;
+    uint64_t threadgroups = 0;
+    uint64_t dispatched_threads = 0;
+    uint64_t cpu_encode_ns = 0;
+    size_t start_sample_index = std::numeric_limits<size_t>::max();
+    size_t end_sample_index = std::numeric_limits<size_t>::max();
+    uint64_t start_timestamp = 0;
+    uint64_t end_timestamp = 0;
+    bool timestamp_valid = false;
+    ProfileMetrics metrics;
+    uint64_t weight_bytes = 0;
+    uint64_t shader_read_bytes = 0;
+};
+
+struct MetalCommandProfileRecord {
+    size_t command_index = 0;
+    std::string phase;
+    size_t sequence_tokens = 0;
+    uint64_t kernel_count = 0;
+    uint64_t threadgroup_count = 0;
+    uint64_t dispatched_threads = 0;
+    uint64_t single_threadgroup_kernels = 0;
+    bool counter_requested = false;
+    bool counter_active = false;
+    std::string counter_status;
+    uint64_t sample_count = 0;
+    double timestamp_ns_per_tick = 0.0;
+    uint64_t cpu_command_create_ns = 0;
+    uint64_t cpu_encode_ns = 0;
+    uint64_t cpu_commit_ns = 0;
+    uint64_t cpu_wait_ns = 0;
+    uint64_t cpu_counter_resolve_ns = 0;
+    uint64_t cpu_total_ns = 0;
+    std::optional<double> commit_to_scheduled_callback_ms;
+    std::optional<double> commit_to_completed_callback_ms;
+    std::optional<double> completed_callback_to_wait_return_ms;
+    std::optional<double> commit_to_gpu_start_ms;
+    std::optional<double> gpu_start_to_kernel_start_ms;
+    std::optional<double> kernel_window_ms;
+    std::optional<double> kernel_end_to_gpu_end_ms;
+    std::optional<double> gpu_duration_ms;
+    std::optional<double> gpu_end_to_wait_return_ms;
+};
+
+class MetalProfiler {
+public:
+    MetalProfiler(const std::string& primary_csv_path,
+                  bool detailed_kernel_timestamps);
+    ~MetalProfiler();
+
+    MetalProfiler(const MetalProfiler&) = delete;
+    MetalProfiler& operator=(const MetalProfiler&) = delete;
+
+    size_t acquire_command_index() noexcept;
+    bool detailed_kernel_timestamps() const noexcept;
+    const std::string& command_csv_path() const noexcept;
+    const std::string& kernel_csv_path() const noexcept;
+    const std::string& operation_csv_path() const noexcept;
+
+    void write(MetalCommandProfileRecord command,
+               const std::vector<MetalKernelProfileRecord>& kernels);
+    void flush();
+
+private:
+    std::ofstream command_output_;
+    std::ofstream kernel_output_;
+    std::ofstream operation_output_;
+    std::string command_csv_path_;
+    std::string kernel_csv_path_;
+    std::string operation_csv_path_;
+    size_t next_command_index_ = 0;
+    bool detailed_kernel_timestamps_ = false;
 };
 
 ProfileMetrics operator+(ProfileMetrics left, const ProfileMetrics& right);

@@ -63,23 +63,26 @@ Q Head 0..6   -> KV Head 0
 Q Head 7..13  -> KV Head 1
 ```
 
-所有模型权重在 GGUF 中可能是 Q4_K_M 等量化格式，但进入当前 Metal 路径前，
-都会先反量化为 FP32。当前所有 GPU 矩阵、激活与 KV Cache 都使用 FP32；
-token id 使用 `int32`，argmax 输出使用 `uint32`。
+Metal 路径不再把矩阵权重整体反量化为 FP32。GGUF 原生的 Q5_0、Q8_0、
+Q4_K、Q6_K 权重以压缩字节长期保存在 GPU 可见 Buffer 中，GEMM/GEVM 在
+点积时按 block 即时解码并使用 FP32 累加。Norm/Bias、所有中间激活和 KV Cache
+仍使用 FP32；token id 使用 `int32`，argmax 输出使用 `uint32`。
 
 ## 2. GPU Buffer 与张量描述符
 
-### 2.1 DeviceMatrix 和 DeviceVector
+### 2.1 DeviceMatrix、DeviceVector 和 QuantizedMatrix
 
 `DeviceMatrix`、`DeviceVector` 是 CPU 侧的小型描述符：
 
 ```text
 DeviceMatrix = MTLBuffer + rows + cols + stride + offset_elements
 DeviceVector = MTLBuffer + length + offset_elements
+QuantizedMatrix = MTLBuffer + ggml_type + rows + cols + row_bytes + offset_bytes
 ```
 
-它们本身不存储数据。真实数据位于 `MTLBuffer`。`offset_elements` 的单位是
-FP32 元素，绑定到 Metal encoder 时再乘 `sizeof(float)` 转换成字节偏移。
+它们本身不存储数据。真实数据位于 `MTLBuffer`。激活描述符的
+`offset_elements` 单位是 FP32 元素；量化权重的 stride/offset 必须以字节表示，
+因为一个 GGML block 对应多个逻辑元素。
 
 这个设计允许不复制数据就建立视图，例如：
 
@@ -95,7 +98,8 @@ FP32 元素，绑定到 Metal encoder 时再乘 `sizeof(float)` 转换成字节�
 | 数据 | Storage Mode | 生命周期 |
 |---|---|---|
 | 模型权重 | `MTLResourceStorageModeShared` | `MetalLLM` 整个生命周期 |
-| 激活 Arena | `MTLResourceStorageModePrivate` | `MetalLLM` 整个生命周期，按固定 slot 复用 |
+| Prefill Arena | `MTLResourceStorageModePrivate` | 一次 prefill command，按实际 prompt 长度分配 |
+| Decode Arena | `MTLResourceStorageModePrivate` | 一轮对话的 decode 阶段，在 token 之间复用 |
 | Token IDs | `MTLResourceStorageModeShared` | 一次 command |
 | Argmax 结果 | `MTLResourceStorageModeShared` | CPU 读取后回收 |
 | K/V Cache | `MTLResourceStorageModePrivate` | `MetalLLM` 整个生命周期 |
@@ -104,7 +108,7 @@ Apple Silicon 使用统一内存，因此 Shared Buffer 不代表每个 kernel �
 复制到独立显存。它代表 CPU 和 GPU 都能访问同一块系统内存。当前流程仍然有
 两类显式 CPU 写入：
 
-- 初始化时把反量化权重 `memcpy` 到持久化 Metal Buffer。
+- 初始化时把每个 tensor 的 GGUF 原始字节 `memcpy` 到持久化 Metal Buffer。
 - 每个 prefill/decode 开始时写入 token id。
 
 算子之间只传递 Buffer，不会把中间矩阵转换回 CPU `Matrix`。
@@ -150,7 +154,7 @@ col = local_index, local_index + 256, local_index + 512, ...
 然后通过 `threadgroup` 内存和树形 reduction 合并结果。这里只能同步同一个
 threadgroup，不能同步整个 GPU 网格。
 
-### 3.3 GEMM 二维 Tile Dispatch
+### 3.3 GEMM 二维 Dispatch
 
 GEMM 使用固定的 `16 x 16` threadgroup：
 
@@ -159,18 +163,19 @@ threads_per_threadgroup = [16, 16, 1] = 256 threads
 threadgroup_grid        = [ceil(N / 16), ceil(M / 16), 1]
 ```
 
-一个 threadgroup 计算输出矩阵的一个 `[16, 16]` Tile；一个线程负责 Tile
-中的一个输出元素。
+一个 threadgroup 覆盖输出矩阵的一个 `[16, 16]` Tile；一个线程负责 Tile
+中的一个输出元素。FP32 fallback kernel 会把输入 Tile 搬到 threadgroup 内存；
+量化权重 kernel 保持相同网格，但每个线程直接流式读取并解码一个权重行。
 
 ## 4. 每个 Kernel 的计算过程
 
-### 4.1 Embedding: `metal_embedding_f32`
+### 4.1 Embedding gather
 
 输入与输出：
 
 ```text
 token_ids: [N]             int32
-embedding: [Vocab, H]      FP32
+embedding: [Vocab, H]      Q5_0/Q8_0/Q4_K/Q6_K 或 FP32
 output:    [N, H]          FP32
 ```
 
@@ -187,10 +192,10 @@ total threads = N * H
 一个线程负责一个 output[position, col]
 ```
 
-对于当前模型，`H=896`，因此 N 个 token 产生 `N*896` 个逻辑线程。
-同一个 token 的 896 个线程读取相同 token id，并读取 Embedding 的一整行。
+对于当前模型，Embedding 是 Q5_0，`H=896`。因此 N 个 token 产生 `N*896`
+个逻辑线程；每个线程定位 token 行及包含该列的 32 元素 block，只解码一个值。
 
-### 4.2 GEMM: `metal_gemm_f32`
+### 4.2 GEMM: FP32 fallback 与量化权重 kernel
 
 通用公式：
 
@@ -217,7 +222,7 @@ Wq[col, k]
 
 而不是先创建一份真正转置后的权重。
 
-Tile 计算步骤：
+`metal_gemm_f32` 的 Tile 计算步骤：
 
 1. `group_id` 决定输出 `[16,16]` Tile 的位置。
 2. `local_id.y` 决定 Tile 内输出行，`local_id.x` 决定输出列。
@@ -244,10 +249,13 @@ K Tile 次数 = 56
 FFN Gate/Up 输出宽度 4864，所以 X 方向有 `4864/16=304` 个 threadgroup。
 FFN Down 的 K 为 4864，因此每个输出线程要遍历 304 个 K Tile。
 
-当前 GEMM 是可读性优先的基础 Tile 实现，还没有使用 simdgroup matrix、
-Metal Performance Shaders 或更复杂的寄存器分块。
+实际 Qwen 权重按类型分派到 `metal_gemm_q5_0_f32`、
+`metal_gemm_q8_0_f32`、`metal_gemm_q4_k_f32` 或
+`metal_gemm_q6_k_f32`。每个输出线程遍历压缩权重行：Q5_0/Q8_0 每 32 个
+权重共享 FP16 scale，Q4_K/Q6_K 每 256 个权重构成一个 super-block；解码值与
+FP32 activation 相乘并累加为 FP32。算子输出和后续算子边界不变。
 
-### 4.3 GEVM/GEMV: `metal_gevm_f32`
+### 4.3 GEVM/GEMV: FP32 fallback 与量化权重 kernel
 
 Decode 的输入只有一个 token，因此 Dense 投影退化为矩阵向量乘法：
 
@@ -255,18 +263,19 @@ Decode 的输入只有一个 token，因此 Dense 投影退化为矩阵向量乘
 y[out] = scale * sum(k, x[k] * W[out, k]) + bias[out]
 ```
 
-线程切分：
+F32、Q5_0、Q8_0、Q4_K 和 Q6_K 路径都采用标量输出切分：
 
 ```text
 一个线程负责一个输出通道 out
 每个线程内部串行遍历全部 input_size
 ```
 
-没有跨线程 reduction。对于 `[output,input]` 权重和
-`matrix_transposed=true`，每个线程连续读取 `W[out, :]`，这对单个线程的
-内存访问是连续的。
+`encode_vector_product()` 根据 GGML 类型选择对应 pipeline。所有类型都按
+`ceil(output_size / threads_per_threadgroup)` 派发；每个 thread 负责一个输出，
+在线程内依次解码该权重行的 GGML block、与 FP32 activation 相乘并累计为
+FP32，最后应用 scale/bias 并写回。
 
-当前模型中常见的派发规模，按每组 256 线程计算：
+Qwen2.5-0.5B 的 Q4_K/Q6_K 派发规模为：
 
 | 投影 | Output | Input | Threadgroups |
 |---|---:|---:|---:|
@@ -277,7 +286,12 @@ y[out] = scale * sum(k, x[k] * W[out, k]) + bias[out]
 | FFN Down | 896 | 4864 | 4 |
 | LM Head | 151936 | 896 | 594 |
 
-这种设计让输出通道提供并行性，但每个线程有一条较长的串行 FMA 依赖链。
+Qwen2.5-14B 的 FFN Gate/Up 为 `[13824,5120]`，各派发 54 个 threadgroup；
+Down 为 `[5120,13824]`，派发 20 个 threadgroup。
+
+固定 4 输出是本机调优结果。8 输出需要更多寄存器，在 14B 的长 K 投影中会降低
+性能；动态 `float[4/8]` 也可能被编译为 thread-local spill，因此 kernel 使用
+显式 `float4` 和固定循环展开。
 
 ### 4.4 RMSNorm: `metal_rmsnorm_f32`
 
@@ -481,12 +495,14 @@ for candidate in 1..151935:
 以 GEMM 为例，`encode_matrix_product()` 在 CPU 上依次执行：
 
 1. 根据 transpose flag 验证 M、N、K。
-2. 从启动时规划好的激活 Arena 取得输出 slot 视图，不申请新的激活 `MTLBuffer`。
-3. 填充 `MetalMatmulParamsHost`。
-4. 从 command buffer 创建 `MTLComputeCommandEncoder`。
-5. 设置 `metal_gemm_f32` 对应的 Pipeline State。
-6. 使用 `setBuffer` 绑定 LHS、RHS、Bias、Output。
-7. 使用 `setBytes` 把 36 字节参数复制进 command 数据。
+2. 从当前阶段开始时规划好的激活 Arena 取得输出 slot 视图，不申请新的激活
+   `MTLBuffer`。
+3. 检查 `QuantizedMatrix.type`，选择 F32、Q5_0、Q8_0、Q4_K 或 Q6_K Pipeline。
+4. F32 fallback 填充 36 字节 `MetalMatmulParamsHost`；量化路径填充包含
+   `weight_row_bytes` 的 28 字节 `MetalQuantizedProductParamsHost`。
+5. 从 command buffer 创建 `MTLComputeCommandEncoder` 并设置对应 Pipeline。
+6. 使用 `setBuffer` 绑定 Activation、原生 GGUF Weight、Bias、Output。
+7. 使用 `setBytes` 把参数复制进 command 数据。
 8. 使用 `dispatchThreadgroups` 记录二维线程网格。
 9. `endEncoding()` 结束这个 encoder。
 10. 立即返回一个指向 Output Buffer 的 `DeviceMatrix` 描述符。
@@ -620,7 +636,8 @@ CPU: finish_async()
      `- 检查 Metal error/status
 
 CPU: 从 Shared Argmax Buffer 读取 uint32 token id
-CPU: 释放本次 command 的 token-id/argmax IO 引用；激活仍留在 Arena
+CPU: 释放本次 command 的 token-id/argmax IO 引用
+CPU: Prefill 释放 Arena；Decode 保留小型 Arena 给下一个 token 复用
 CPU: 更新 sequence_length
 ```
 
@@ -630,11 +647,17 @@ CPU: 更新 sequence_length
 
 ### 8.1 激活 Arena 生命周期
 
-`MetalLLM::Impl::allocate_activation_arena()` 在模型加载完成后调用一次。它
-根据 `max_sequence` 为每个逻辑 slot 计算字节偏移和容量，然后申请一个
-`MTLResourceStorageModePrivate` 的大 `MTLBuffer`。之后每个 `encode_*` 只构造
-带有 `offset_elements` 的 `DeviceMatrix`/`DeviceVector` 视图；中间激活不会再
-触发逐算子 `newBufferWithLength:`。
+模型加载阶段不再分配 Activation Arena。每次 `prefill()` 已经知道 tokenizer
+产生的实际 token 数 `N`，因此先为所有行形状 slot 规划 `N` 行，并为
+AttentionScores 规划 `[N, N]`，然后申请一个
+`MTLResourceStorageModePrivate` Buffer。同步 command 完成且 Argmax 已读回后，
+Prefill Arena 立即释放，只有独立的 K/V Cache 继续保留。
+
+第一次 `decode()` 为行形状 slot 只规划 1 行，为 AttentionScores 规划
+`[1, max_sequence]`，并申请一个小型 Decode Arena。后续 decode token 直接复用
+该 Buffer；下一轮对话的 `reset()` 再释放它。阶段内部的每个 `encode_*` 仍只构造
+带 `offset_elements` 的 `DeviceMatrix`/`DeviceVector` 视图，因此没有恢复逐算子的
+`newBufferWithLength:`。
 
 当前 slot 的主要复用关系是：
 
@@ -651,10 +674,21 @@ kernel 才读取同一 slot；Softmax 和 SwiGLU 的同址读写只对每个元�
 Softmax 在写出前已完成行内 reduction，因此这些别名在当前 kernel 语义下是
 安全的。不同层之间复用 slot 也安全，因为同一 command 中层序是串行依赖的。
 
-Arena 的容量是一次性按 `max_sequence` 预留，不做大小分桶。当前非融合 Prefill
-Attention 需要一个 `[max_sequence, max_sequence]` FP32 Score/Probability 区域，
-所以默认使用模型上下文长度时内存可能很大；这也是 `--max-sequence` 存在的
-原因。该参数不能超过 GGUF 的 context length。
+对于 Qwen2.5-0.5B，保持全部中间结果为 FP32 时，Prefill Arena 的字节数近似为：
+
+```text
+4 * (N^2 + 16384 * N + 151936)
+```
+
+Decode Arena 的最大字节数为：
+
+```text
+4 * (max_sequence + 16384 + 151936)
+```
+
+当 `max_sequence = 32768` 时，Decode Arena 约为 0.767 MiB。Prefill 仍然使用
+dense `[N, N]` Score，所以极长 prompt 的开销仍为 O(N^2)；该改造消除的是按
+`max_sequence` 为短 prompt 和 decode 过量预留的问题。
 
 ## 9. MetalLLM 初始化过程
 
@@ -665,17 +699,17 @@ Attention 需要一个 `[max_sequence, max_sequence]` FP32 Score/Probability 区
 3. 读取 `metal_llm.metal` 源码。
 4. `newLibraryWithSource` 在运行时编译 Metal Library。
 5. 为每个 kernel 创建一个 `MTLComputePipelineState`。
-6. `ModelFile` 读取 GGUF Metadata 和 Tensor。
-7. GGUF 权重临时反量化为 CPU FP32 `Matrix/Vector`。
-8. `upload_model()` 把所有权重一次性放入持久化 Metal Buffer。
-9. CPU 临时权重离开作用域并释放。
+6. 独立的 `MetalRawModel` 流式读取 GGUF Metadata 和 Tensor Directory。
+7. 根据 GGML 类型、block size 和逻辑列数计算每行原始字节数。
+8. 每次只读取一个 `RawTensor`，保持 GGUF 量化 payload 不变并上传到持久 Buffer。
+9. 单 tensor CPU 暂存立即释放；不创建 CPU FP32 `Matrix/Vector`。
 10. 为 24 层分配固定容量的 Private K/V Buffer。
-11. 按 `max_sequence` 计算所有激活 slot 的偏移，并分配一个 Private
-    activation Arena。
+11. 不分配 Activation Arena；它由后续 prefill/decode 按阶段创建。
 
-之后所有对话共享同一套权重和已分配 KV Buffer。`reset()` 只把
-`sequence_length` 设为 0，不清零 GPU Buffer，因为后续 kernel 只读取逻辑有效
-范围，而新 Prefill 会覆盖从第 0 行开始的 Cache。
+之后所有对话共享同一套权重和已分配 KV Buffer。`reset()` 释放上一轮的 Decode
+Arena、清零本轮 Arena 峰值并把 `sequence_length` 设为 0，但不清零 GPU KV
+Buffer，因为后续 kernel 只读取逻辑有效范围，而新 Prefill 会覆盖从第 0 行开始
+的 Cache。
 
 ## 10. 从 Chat 输入到生成文本
 
@@ -713,7 +747,60 @@ generate()
 拼回新 Prompt。跨轮上下文如果需要保留，应由 Chat 层构造完整历史 token 序列，
 而不是依赖旧 KV Buffer 中未清零的字节。
 
-## 11. 当前实现没有做什么
+## 11. Command 与 Kernel 性能统计
+
+启用普通 profiling 后，Metal 除通用的 `llm_profile.csv` 外，还会产生：
+
+```text
+*_metal_commands.csv   每个 Prefill/Decode command buffer 一行
+*_metal_kernels.csv    详细模式下每个 compute encoder/dispatch 一行
+*_metal_ops.csv        同一 command 内按 operation/pipeline/type 聚合
+```
+
+Command CSV 是低扰动的真实延迟基线。最重要的字段是：
+
+```text
+cpu_encode_ms                 CPU 记录整张计算图的时间
+cpu_commit_ms                 commit() 调用本身的时间
+commit_to_gpu_start_ms        command 在 GPU 开始前的真实等待时间
+gpu_duration_ms               GPUStartTime 到 GPUEndTime
+cpu_wait_ms                   CPU 在 waitUntilCompleted() 中阻塞的时间
+kernel_count                  command 内的 compute dispatch 数
+single_threadgroup_kernels    只派发一个 threadgroup 的 kernel 数
+```
+
+`scheduledHandler` 和 `completedHandler` 的字段带有 `_callback_`，表示 CPU
+实际收到回调的时间。系统可能延迟执行 handler，因此判断 command queue 是否拥塞
+应使用 `commit_to_gpu_start_ms`，不能使用 scheduled callback。
+
+详细模式通过 `--metal-kernel-profile` 或
+`make run METAL_KERNEL_PROFILE=1` 开启。每个 kernel 记录 layer/head、pipeline、
+M/N/K、threadgroup 网格、GPU 时间、前序间隙、量化权重字节和估算 FLOPs。
+一个 counter sample buffer 最多保存 4096 个 timestamp，因此实现会自动使用多个
+buffer；Qwen2.5-14B Decode 的 6484 个 kernel 需要 12968 个 timestamp。
+
+本机 Apple M4 不支持 dispatch-boundary sampling，但支持 stage-boundary sampling。
+由于当前每个 compute encoder 只有一个 dispatch，encoder start/end 就对应单个
+kernel 的边界。`MTLCounterResultTimestamp` 已经以纳秒表示，不应使用
+`sampleTimestamps()` 的另一套 GPU tick 再次换算。
+
+详细采样会扰动调度。尤其是 stage-boundary 模式会明显放大相邻 kernel 的 gap；
+因此必须分别运行两次：普通模式判断真实 token latency、CPU 下发和 queue 等待，
+详细模式只用来分解 kernel 本体及比较算子。详细模式中
+`sampled_kernel_ms + sampled_gap_ms == sampled_span_ms`，且 sample span 应与
+command 的 GPU duration 闭合，但其中 gap 不代表未采样运行时的真实 gap。
+
+Qwen2.5 的每个 layer 有 15 个固定 dispatch，每个 Q Head 另有 QK、Softmax、AV
+三个 dispatch。完整 forward 的数量为：
+
+```text
+kernel_count = 4 + layer_count * (15 + 3 * q_head_count)
+```
+
+所以 0.5B 为 `4 + 24*(15+3*14) = 1372`，14B 为
+`4 + 48*(15+3*40) = 6484`。
+
+## 12. 当前实现没有做什么
 
 为了准确理解性能，还需要明确当前没有以下优化：
 
@@ -725,7 +812,8 @@ generate()
 - 没有并行 Argmax。
 - 没有 simdgroup matrix 或 MPS GEMM。
 - 没有 FP16/BF16/INT8/INT4 Metal 计算。
-- 没有使用 Flash Attention，因此 Score/Probability slot 仍按二维矩阵预留。
+- 没有使用 Flash Attention，因此 Prefill 的 Score/Probability slot 仍按实际
+  prompt 长度预留二维 `[N, N]` 矩阵。
 - 没有把多个 decode token 放入同一 command，因为下一个 token 依赖上一步
   Argmax。
 
@@ -735,7 +823,7 @@ dispatch/encoder 开销可能接近甚至超过计算本身。后续优化应优
 验证以下方向：合并 Head dispatch、并行 Argmax、融合逐元素算子、优化 GEVM，
 最后再考虑更复杂的 Attention 融合。
 
-## 12. 代码导航
+## 13. 代码导航
 
 | 目标 | 文件/函数 |
 |---|---|

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "memory_stats.h"
+#include "metal_model.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -10,12 +11,12 @@
 
 namespace llm {
 
-struct ModelConfig;
-
-// Complete Metal runtime for one loaded model. The constructor parses GGUF,
-// uploads every model weight, allocates fixed-capacity GPU KV buffers and one
-// activation Arena, and then releases the temporary CPU tensors. reset() starts
-// a new conversation while retaining the model and all planned allocations.
+// Complete Metal runtime for one loaded model. The constructor streams native
+// GGUF tensor bytes into persistent GPU-visible buffers without dequantizing
+// matrix weights, then allocates fixed-capacity FP32 KV buffers. Prefill uses an
+// arena sized to the actual prompt; decode lazily allocates and reuses a one-row
+// arena. reset() starts a new conversation while retaining weights and KV
+// allocation.
 class MetalLLM {
 public:
     explicit MetalLLM(const std::string& gguf_path,
@@ -32,10 +33,11 @@ public:
     std::int32_t prefill(const std::vector<std::int32_t>& token_ids);
     std::int32_t decode(std::int32_t token_id);
 
-    void enable_profiling(const std::string& csv_path);
+    void enable_profiling(const std::string& csv_path,
+                          bool detailed_kernel_timestamps = false);
     void disable_profiling();
 
-    const ModelConfig& config() const;
+    const MetalModelConfig& config() const;
     std::size_t position() const noexcept;
     std::size_t max_sequence() const noexcept;
     bool uses_gpu() const noexcept;
