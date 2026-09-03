@@ -2,6 +2,7 @@
 
 #include "cpu_llm.h"
 #include "metal_llm.h"
+#include "moe_llm.h"
 #include "model.h"
 
 #include <algorithm>
@@ -99,11 +100,36 @@ bool is_ascii_letter(uint32_t value) {
 
 bool is_number(uint32_t value);
 
+bool is_mark(uint32_t value) {
+    // The qwen35 pre-tokenizer differs from qwen2 by attaching Unicode mark
+    // characters to letter runs. These ranges cover the combining-mark blocks
+    // and the script-specific marks most likely to be separated by the coarse
+    // script ranges in is_letter().
+    return (value >= 0x0300U && value <= 0x036fU) ||
+           (value >= 0x0483U && value <= 0x0489U) ||
+           (value >= 0x0591U && value <= 0x05bdU) || value == 0x05bfU ||
+           (value >= 0x05c1U && value <= 0x05c2U) ||
+           (value >= 0x05c4U && value <= 0x05c5U) || value == 0x05c7U ||
+           (value >= 0x0610U && value <= 0x061aU) ||
+           (value >= 0x064bU && value <= 0x065fU) || value == 0x0670U ||
+           (value >= 0x06d6U && value <= 0x06dcU) ||
+           (value >= 0x06dfU && value <= 0x06e4U) ||
+           (value >= 0x06e7U && value <= 0x06e8U) ||
+           (value >= 0x06eaU && value <= 0x06edU) || value == 0x0711U ||
+           (value >= 0x0730U && value <= 0x074aU) ||
+           (value >= 0x1ab0U && value <= 0x1affU) ||
+           (value >= 0x1dc0U && value <= 0x1dffU) ||
+           (value >= 0x20d0U && value <= 0x20ffU) ||
+           (value >= 0xfe00U && value <= 0xfe0fU) ||
+           (value >= 0xfe20U && value <= 0xfe2fU) ||
+           (value >= 0xe0100U && value <= 0xe01efU);
+}
+
 bool is_letter(uint32_t value) {
     if (is_ascii_letter(value)) {
         return true;
     }
-    if (is_number(value)) {
+    if (is_number(value) || is_mark(value)) {
         return false;
     }
     // These ranges cover the scripts normally encountered by the Qwen chat
@@ -178,9 +204,14 @@ size_t contraction_length(const std::vector<Codepoint> & points, size_t position
     return 0;
 }
 
-std::vector<std::pair<size_t, size_t>> pretokenize(const std::string & text) {
+std::vector<std::pair<size_t, size_t>> pretokenize(
+    const std::string & text,
+    bool include_marks) {
     const std::vector<Codepoint> points = decode_utf8(text);
     std::vector<std::pair<size_t, size_t>> pieces;
+    const auto is_word_character = [include_marks](uint32_t value) {
+        return is_letter(value) || (include_marks && is_mark(value));
+    };
     size_t position = 0;
     while (position < points.size()) {
         const size_t begin = position;
@@ -192,14 +223,16 @@ std::vector<std::pair<size_t, size_t>> pretokenize(const std::string & text) {
             continue;
         }
 
-        // [^\r\n\p{L}\p{N}]?\p{L}+: the optional prefix is consumed
-        // together with the following letter run.
+        // qwen2 uses L+ and qwen35 uses [L M]+. In both cases the optional
+        // prefix is consumed together with the following word-character run.
         if ((!is_line_break(points[position].value) &&
              !is_number(points[position].value)) &&
-            (is_letter(points[position].value) ||
-             (position + 1 < points.size() && is_letter(points[position + 1].value)))) {
+            (is_word_character(points[position].value) ||
+             (position + 1 < points.size() &&
+              is_word_character(points[position + 1].value)))) {
             ++position;
-            while (position < points.size() && is_letter(points[position].value)) {
+            while (position < points.size() &&
+                   is_word_character(points[position].value)) {
                 ++position;
             }
             pieces.emplace_back(points[begin].begin, points[position - 1].end);
@@ -219,12 +252,12 @@ std::vector<std::pair<size_t, size_t>> pretokenize(const std::string & text) {
         size_t punctuation = position + (has_space_prefix ? 1 : 0);
         if (punctuation < points.size() &&
             !is_space(points[punctuation].value) &&
-            !is_letter(points[punctuation].value) &&
+            !is_word_character(points[punctuation].value) &&
             !is_number(points[punctuation].value)) {
             position = punctuation;
             while (position < points.size() &&
                    !is_space(points[position].value) &&
-                   !is_letter(points[position].value) &&
+                   !is_word_character(points[position].value) &&
                    !is_number(points[position].value)) {
                 ++position;
             }
@@ -322,8 +355,10 @@ std::vector<uint32_t> byte_encode(const std::string & text) {
 class QwenTokenizer {
 public:
     QwenTokenizer(const std::vector<std::string> & vocabulary,
-                  const std::vector<std::string> & merges)
-        : vocabulary_(vocabulary) {
+                  const std::vector<std::string> & merges,
+                  const std::string & tokenizer_pre)
+        : vocabulary_(vocabulary),
+          include_marks_(tokenizer_pre == "qwen35") {
         for (size_t index = 0; index < vocabulary.size(); ++index) {
             vocabulary_ids_.emplace(vocabulary[index], static_cast<int32_t>(index));
             if (vocabulary[index].size() >= 4 && vocabulary[index].compare(0, 2, "<|") == 0 &&
@@ -433,7 +468,7 @@ private:
     }
 
     void encode_ordinary(const std::string & text, std::vector<int32_t> & output) const {
-        for (const auto & range : pretokenize(text)) {
+        for (const auto & range : pretokenize(text, include_marks_)) {
             const std::string piece = text.substr(range.first, range.second - range.first);
             encode_piece_with_chunks(piece, output);
         }
@@ -490,12 +525,14 @@ private:
     std::unordered_set<int32_t> special_ids_;
     std::unordered_map<std::string, size_t> merge_ranks_;
     std::unordered_map<uint32_t, uint8_t> byte_decoder_;
+    bool include_marks_ = false;
 };
 
 struct Options {
     std::string model_path;
     int max_new_tokens = 32;
     std::size_t max_sequence = 0;
+    std::size_t expert_cache_count = 8;
     bool raw_prompt = false;
     bool use_gpu = false;
     bool help_requested = false;
@@ -508,7 +545,8 @@ struct Options {
 void usage(const char * program) {
     std::cerr << "Usage: " << program << " --model MODEL.gguf [options]\n"
               << "  --tokens N       Maximum generated tokens per input, default 32\n"
-              << "  --max-sequence N Maximum model sequence capacity (default model context)\n"
+              << "  --max-sequence N Maximum sequence capacity (backend-specific default)\n"
+              << "  --expert-cache N Per-layer routed-expert cache slots, default 8\n"
               << "  --system TEXT    System message used by ChatML\n"
               << "  --raw            Send input directly without ChatML wrapping\n"
               << "  --gpu            Use the Metal GPU backend (no CPU fallback)\n"
@@ -575,6 +613,15 @@ bool parse_options(int argc, char ** argv, Options & options) {
                     "--max-sequence does not fit in size_t");
             }
             options.max_sequence = static_cast<std::size_t>(parsed);
+        } else if (argument == "--expert-cache") {
+            const unsigned long long parsed = std::stoull(
+                value("--expert-cache"));
+            if (parsed > static_cast<unsigned long long>(
+                              std::numeric_limits<std::size_t>::max())) {
+                throw std::out_of_range(
+                    "--expert-cache does not fit in size_t");
+            }
+            options.expert_cache_count = static_cast<std::size_t>(parsed);
         } else if (argument == "--system") {
             options.system_prompt = value("--system");
         } else if (argument == "--raw") {
@@ -711,6 +758,10 @@ void print_generation_stats(const GenerationStats & stats) {
               << " weight_mib=" << bytes_to_mib(stats.memory.weight_bytes)
               << " kv_cache_bytes=" << stats.memory.kv_cache_bytes
               << " kv_cache_mib=" << bytes_to_mib(stats.memory.kv_cache_bytes)
+              << " recurrent_state_bytes="
+              << stats.memory.recurrent_state_bytes
+              << " recurrent_state_mib="
+              << bytes_to_mib(stats.memory.recurrent_state_bytes)
               << " intermediate_bytes=" << stats.memory.intermediate_bytes
               << " intermediate_mib="
               << bytes_to_mib(stats.memory.intermediate_bytes)
@@ -811,17 +862,28 @@ std::string backend_description(const llm::MetalLLM & backend) {
     return "Metal device=" + backend.device_name();
 }
 
+std::string backend_description(const llm::MoeLLM & backend) {
+    return "Metal MoE device=" + backend.device_name() +
+        " expert_cache_per_layer=" +
+        std::to_string(backend.expert_cache_count());
+}
+
+template <typename Backend>
+constexpr bool is_metal_backend =
+    std::is_same_v<Backend, llm::MetalLLM> ||
+    std::is_same_v<Backend, llm::MoeLLM>;
+
 template <typename Backend>
 int run_interactive(const Options & options, Backend & backend) {
     if (options.profiling_enabled) {
-        if constexpr (std::is_same_v<Backend, llm::MetalLLM>) {
+        if constexpr (is_metal_backend<Backend>) {
             backend.enable_profiling(
                 options.profile_csv_path, options.metal_kernel_profile);
         } else {
             backend.enable_profiling(options.profile_csv_path);
         }
         std::cerr << "[chat] profile_csv=" << options.profile_csv_path << "\n";
-        if constexpr (std::is_same_v<Backend, llm::MetalLLM>) {
+        if constexpr (is_metal_backend<Backend>) {
             const std::filesystem::path primary(options.profile_csv_path);
             const std::filesystem::path parent = primary.parent_path();
             const std::string stem = primary.stem().empty()
@@ -841,7 +903,8 @@ int run_interactive(const Options & options, Backend & backend) {
         throw std::runtime_error(
             "model does not contain Qwen tokenizer vocabulary/merges");
     }
-    QwenTokenizer tokenizer(config.vocabulary, config.merges);
+    QwenTokenizer tokenizer(
+        config.vocabulary, config.merges, config.tokenizer_pre);
 
     const int32_t im_end = tokenizer.id("<|im_end|>");
     if (im_end < 0) {
@@ -899,6 +962,16 @@ GenerationResult run(llm::MetalLLM & backend,
         stop_token_ids, std::move(token_sink));
 }
 
+GenerationResult run(llm::MoeLLM & backend,
+                     std::vector<int32_t> initial_sequence,
+                     size_t max_new_tokens,
+                     const std::vector<int32_t> & stop_token_ids,
+                     TokenSink token_sink) {
+    return generate(
+        backend, std::move(initial_sequence), max_new_tokens,
+        stop_token_ids, std::move(token_sink));
+}
+
 int run_cli(int argc, char ** argv) {
     try {
         Options options;
@@ -921,6 +994,17 @@ int run_cli(int argc, char ** argv) {
 
         std::cerr << "[chat] loading model: " << options.model_path << "\n";
         if (options.use_gpu) {
+            std::string architecture;
+            {
+                llm::MetalRawModel probe(options.model_path);
+                architecture = probe.config().architecture;
+            }
+            if (architecture == "qwen35moe") {
+                llm::MoeLLM backend(
+                    options.model_path, options.max_sequence,
+                    {}, options.expert_cache_count);
+                return run_interactive(options, backend);
+            }
             llm::MetalLLM backend(options.model_path, options.max_sequence);
             return run_interactive(options, backend);
         }

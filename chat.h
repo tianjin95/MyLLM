@@ -10,6 +10,7 @@
 namespace llm {
 class CPULLM;
 class MetalLLM;
+class MoeLLM;
 }
 
 namespace chat {
@@ -53,6 +54,12 @@ GenerationResult run(llm::CPULLM& backend,
                      TokenSink token_sink = {});
 
 GenerationResult run(llm::MetalLLM& backend,
+                     std::vector<std::int32_t> initial_sequence,
+                     std::size_t max_new_tokens,
+                     const std::vector<std::int32_t>& stop_token_ids = {},
+                     TokenSink token_sink = {});
+
+GenerationResult run(llm::MoeLLM& backend,
                      std::vector<std::int32_t> initial_sequence,
                      std::size_t max_new_tokens,
                      const std::vector<std::int32_t>& stop_token_ids = {},

@@ -19,9 +19,11 @@ MODEL ?= ../../models/qwen2.5-0.5b-instruct/qwen2.5-0.5b-instruct-q4_k_m.gguf
 # TOKENS is the canonical name; TOKEN is accepted as a compatibility alias.
 TOKENS ?= $(if $(TOKEN),$(TOKEN),32)
 MAX_SEQUENCE ?=
+EXPERT_CACHE ?= 8
 RAW_FLAG = $(if $(RAW),--raw,)
 GPU_FLAG = $(if $(GPU),--gpu,)
 MAX_SEQUENCE_FLAG = $(if $(MAX_SEQUENCE),--max-sequence "$(MAX_SEQUENCE)",)
+EXPERT_CACHE_FLAG = $(if $(EXPERT_CACHE),--expert-cache "$(EXPERT_CACHE)",)
 SYSTEM_FLAG = $(if $(SYSTEM),--system "$(SYSTEM)",)
 PROFILE_FLAG = $(if $(NO_PROFILE),--no-profile,--profile-csv "$(PROFILE_CSV)")
 METAL_KERNEL_PROFILE_FLAG = $(if $(METAL_KERNEL_PROFILE),--metal-kernel-profile,)
@@ -32,8 +34,10 @@ OBJECTS := \
 	$(BUILD_DIR)/cpu_llm.o \
 	$(BUILD_DIR)/model.o \
 	$(BUILD_DIR)/metal_model.o \
+	$(BUILD_DIR)/moe_model.o \
 	$(BUILD_DIR)/profiler.o \
-	$(METAL_OBJECT)
+	$(METAL_OBJECT) \
+	$(BUILD_DIR)/moe_llm.o
 
 .PHONY: all run clean help
 
@@ -45,7 +49,7 @@ $(TARGET): $(OBJECTS)
 $(BUILD_DIR):
 	mkdir -p $@
 
-$(BUILD_DIR)/chat.o: chat.cpp chat.h memory_stats.h cpu_llm.h metal_llm.h metal_model.h model.h | $(BUILD_DIR)
+$(BUILD_DIR)/chat.o: chat.cpp chat.h memory_stats.h cpu_llm.h metal_llm.h moe_llm.h metal_model.h model.h | $(BUILD_DIR)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -MMD -MP -c $< -o $@
 
 $(BUILD_DIR)/cpu_llm.o: cpu_llm.cpp cpu_llm.h memory_stats.h model.h profiler.h | $(BUILD_DIR)
@@ -57,16 +61,22 @@ $(BUILD_DIR)/model.o: model.cpp model.h cpu_llm.h | $(BUILD_DIR)
 $(BUILD_DIR)/metal_model.o: metal_model.cpp metal_model.h | $(BUILD_DIR)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -MMD -MP -c $< -o $@
 
+$(BUILD_DIR)/moe_model.o: moe_model.cpp moe_model.h metal_model.h | $(BUILD_DIR)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -MMD -MP -c $< -o $@
+
 $(BUILD_DIR)/profiler.o: profiler.cpp profiler.h | $(BUILD_DIR)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -MMD -MP -c $< -o $@
 
 $(BUILD_DIR)/metal_llm.o: metal_llm.mm metal_llm.h metal_model.h memory_stats.h metal_llm.metal profiler.h | $(BUILD_DIR)
 	$(OBJCXX) $(CPPFLAGS) $(CXXFLAGS) $(METAL_CXXFLAGS) -MMD -MP -c $< -o $@
 
+$(BUILD_DIR)/moe_llm.o: moe_llm.mm moe_llm.h moe_model.h metal_model.h memory_stats.h metal_llm.metal profiler.h | $(BUILD_DIR)
+	$(OBJCXX) $(CPPFLAGS) $(CXXFLAGS) $(METAL_CXXFLAGS) -MMD -MP -c $< -o $@
+
 -include $(OBJECTS:.o=.d)
 
 run: $(TARGET)
-	./$(TARGET) --model "$(MODEL)" --tokens "$(TOKENS)" $(MAX_SEQUENCE_FLAG) $(RAW_FLAG) $(GPU_FLAG) $(SYSTEM_FLAG) $(PROFILE_FLAG) $(METAL_KERNEL_PROFILE_FLAG)
+	./$(TARGET) --model "$(MODEL)" --tokens "$(TOKENS)" $(MAX_SEQUENCE_FLAG) $(EXPERT_CACHE_FLAG) $(RAW_FLAG) $(GPU_FLAG) $(SYSTEM_FLAG) $(PROFILE_FLAG) $(METAL_KERNEL_PROFILE_FLAG)
 
 clean:
 	rm -rf $(BUILD_DIR) $(TARGET)
@@ -78,6 +88,7 @@ help:
 		'make run TOKENS=4          Limit greedy generation to 4 tokens' \
 		'make run TOKEN=4           TOKEN is an alias for TOKENS' \
 		'make run MAX_SEQUENCE=2048  Set the fixed model sequence capacity' \
+		'make run EXPERT_CACHE=16     Cache 16 routed experts per MoE layer' \
 		'make run RAW=1             Skip ChatML wrapping' \
 		'make run GPU=1              Require the Metal GPU backend' \
 		'make run SYSTEM="..."     Set the ChatML system message' \

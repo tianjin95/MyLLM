@@ -25,6 +25,7 @@ enum class MetalGgmlType : std::uint32_t {
     Q4_K = 12,
     Q5_K = 13,
     Q6_K = 14,
+    BF16 = 30,
 };
 
 const char* metal_ggml_type_name(MetalGgmlType type) noexcept;
@@ -38,7 +39,12 @@ struct MetalModelConfig {
     std::size_t tensor_count = 0;
     std::size_t parameter_count = 0;
     std::size_t stored_weight_bytes = 0;
+    // Some architectures append optional draft/MTP blocks after the decoder
+    // stack. layer_count is always the number of layers in the normal text
+    // graph; total_layer_count includes those optional blocks.
     std::size_t layer_count = 0;
+    std::size_t total_layer_count = 0;
+    std::size_t nextn_layer_count = 0;
     std::size_t embedding_size = 0;
     std::size_t feed_forward_size = 0;
     std::size_t attention_head_count = 0;
@@ -50,6 +56,16 @@ struct MetalModelConfig {
     std::int32_t eos_token_id = 0;
     float rope_theta = 1000000.0f;
     float norm_epsilon = 1e-6f;
+    std::size_t full_attention_interval = 0;
+    std::size_t expert_count = 0;
+    std::size_t expert_used_count = 0;
+    std::size_t expert_feed_forward_size = 0;
+    std::size_t shared_expert_feed_forward_size = 0;
+    std::size_t ssm_conv_kernel = 0;
+    std::size_t ssm_state_size = 0;
+    std::size_t ssm_group_count = 0;
+    std::size_t ssm_time_step_rank = 0;
+    std::size_t ssm_inner_size = 0;
     std::vector<std::string> vocabulary;
     std::vector<std::string> merges;
     std::string tokenizer_pre;
@@ -71,6 +87,21 @@ struct RawTensor {
     std::size_t byte_size() const noexcept {
         return data.size();
     }
+};
+
+// Metadata for a tensor that remains in the GGUF file.  Keeping descriptors
+// separate from RawTensor makes it explicit that no tensor payload has been
+// materialized on the CPU.  data_offset is an absolute byte offset in the
+// GGUF file and byte_size covers all flattened rows.
+struct RawTensorDescriptor {
+    std::string name;
+    MetalGgmlType type = MetalGgmlType::F32;
+    std::vector<std::uint64_t> dimensions;
+    std::size_t rows = 0;
+    std::size_t cols = 0;
+    std::size_t row_bytes = 0;
+    std::size_t data_offset = 0;
+    std::size_t byte_size = 0;
 };
 
 // GPU-specific layer staging.  Unlike the CPU Layer in model.h, every matrix
@@ -107,6 +138,22 @@ public:
     RawTensor load_output_norm();
     RawTensor load_output_weight();
     MetalRawLayer load_layer(std::size_t layer_index);
+
+    // Architecture-specific GPU loaders may reuse the streaming GGUF reader
+    // without depending on the qwen2 layer schema above.
+    bool has_tensor(const std::string& name) const noexcept;
+    RawTensor load_tensor(const std::string& name,
+                          std::size_t expected_rows,
+                          std::size_t expected_cols);
+    RawTensorDescriptor describe_tensor(const std::string& name,
+                                        std::size_t expected_rows,
+                                        std::size_t expected_cols);
+    void read_tensor_slice(const RawTensorDescriptor& tensor,
+                           std::size_t relative_offset,
+                           void* destination,
+                           std::size_t bytes) const;
+    void ignore_tensor(const std::string& name);
+    void ignore_tensor_prefix(const std::string& prefix);
     void validate_all_tensors_loaded() const;
 
 private:

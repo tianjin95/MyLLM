@@ -3470,6 +3470,7 @@ MemoryStats MetalLLM::memory_stats() const noexcept {
     return {
         static_cast<std::uint64_t>(impl_->prepared.weight_bytes),
         static_cast<std::uint64_t>(impl_->kv_cache_bytes),
+        0,
         static_cast<std::uint64_t>(impl_->turn_peak_activation_bytes),
         false,
     };

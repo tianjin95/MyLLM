@@ -99,6 +99,66 @@ struct MetalArgmaxParams {
     uint length;
 };
 
+struct MetalSplitQGateParams {
+    uint rows;
+    uint head_count;
+    uint head_dim;
+};
+
+struct MetalBroadcastParams {
+    uint rows;
+    uint cols;
+};
+
+struct MetalRowScaleParams {
+    uint rows;
+    uint cols;
+    uint weight_stride;
+    uint weight_column;
+};
+
+struct MetalHeadNormParams {
+    uint tokens;
+    uint head_count;
+    uint head_dim;
+    uint input_token_stride;
+    float epsilon;
+};
+
+struct MetalDepthwiseConvParams {
+    uint tokens;
+    uint channels;
+    uint kernel_size;
+};
+
+struct MetalGdnParams {
+    uint tokens;
+    uint key_head_count;
+    uint value_head_count;
+    uint head_dim;
+    uint q_stride;
+    uint k_stride;
+    uint v_stride;
+    uint output_stride;
+};
+
+struct MetalTopKParams {
+    uint rows;
+    uint cols;
+    uint k;
+};
+
+struct MetalExpertProductParams {
+    uint rows;
+    uint output_size;
+    uint input_size;
+    uint activation_stride;
+    uint weight_row_bytes;
+    uint expert_stride_bytes;
+    uint route_stride;
+    uint route_index;
+};
+
 #define MYLLM_TILE_M 16
 #define MYLLM_TILE_N 16
 #define MYLLM_TILE_K 16
@@ -376,6 +436,57 @@ inline float dot_q4_k_f32_packed_reuse(device const uchar * row,
     return accumulator;
 }
 
+inline float dot_q5_k_f32(device const uchar * row,
+                          device const float * activation,
+                          uint columns) {
+    float accumulator = 0.0f;
+    for (uint block_index = 0; block_index < columns / 256;
+         ++block_index) {
+        device const uchar * block = row + block_index * 176;
+        const float d = load_f16_le(block);
+        const float dmin = load_f16_le(block + 2);
+        device const uchar * scales = block + 4;
+        device const uchar * high_bits = block + 16;
+        device const uchar * quants = block + 48;
+        const uint activation_offset = block_index * 256;
+
+        for (uint group = 0; group < 4; ++group) {
+            const uint2 low_scale_min = q4_k_scale_min(scales, group * 2);
+            const uint2 high_scale_min = q4_k_scale_min(
+                scales, group * 2 + 1);
+            const uint low_high_mask = 1u << (group * 2);
+            const uint high_high_mask = 2u << (group * 2);
+            device const uchar * packed = quants + group * 32;
+            const uint group_offset = activation_offset + group * 64;
+
+            float low_quant_dot = 0.0f;
+            float high_quant_dot = 0.0f;
+            float low_activation_sum = 0.0f;
+            float high_activation_sum = 0.0f;
+            for (uint local = 0; local < 32; ++local) {
+                const uint packed_value = uint(packed[local]);
+                const uint low_quant = (packed_value & 0x0f) +
+                    ((uint(high_bits[local]) & low_high_mask) != 0 ? 16 : 0);
+                const uint high_quant = (packed_value >> 4) +
+                    ((uint(high_bits[local]) & high_high_mask) != 0 ? 16 : 0);
+                const float low_activation =
+                    activation[group_offset + local];
+                const float high_activation =
+                    activation[group_offset + local + 32];
+                low_quant_dot += low_activation * float(low_quant);
+                high_quant_dot += high_activation * float(high_quant);
+                low_activation_sum += low_activation;
+                high_activation_sum += high_activation;
+            }
+            accumulator += d * float(low_scale_min.x) * low_quant_dot -
+                           dmin * float(low_scale_min.y) * low_activation_sum;
+            accumulator += d * float(high_scale_min.x) * high_quant_dot -
+                           dmin * float(high_scale_min.y) * high_activation_sum;
+        }
+    }
+    return accumulator;
+}
+
 inline float dot_q6_k_f32(device const uchar * row,
                           device const float * activation,
                           uint columns) {
@@ -550,6 +661,23 @@ kernel void metal_gemm_q4_k_f32(
     output[row * params.n + col] = value;
 }
 
+kernel void metal_gemm_q5_k_f32(
+        device const float * activation [[buffer(0)]],
+        device const uchar * weight [[buffer(1)]],
+        device const float * bias [[buffer(2)]],
+        device float * output [[buffer(3)]],
+        constant MetalQuantizedProductParams & params [[buffer(4)]],
+        uint2 position [[thread_position_in_grid]]) {
+    const uint col = position.x;
+    const uint row = position.y;
+    if (row >= params.m || col >= params.n) return;
+    float value = dot_q5_k_f32(
+        weight + col * params.weight_row_bytes,
+        activation + row * params.activation_stride, params.k) * params.scale;
+    if (params.has_bias != 0) value += bias[col];
+    output[row * params.n + col] = value;
+}
+
 kernel void metal_gemm_q6_k_f32(
         device const float * activation [[buffer(0)]],
         device const uchar * weight [[buffer(1)]],
@@ -608,6 +736,21 @@ kernel void metal_gevm_q4_k_f32(
         uint output_index [[thread_position_in_grid]]) {
     if (output_index >= params.n) return;
     float value = dot_q4_k_f32_packed_reuse(
+        weight + output_index * params.weight_row_bytes,
+        activation, params.k) * params.scale;
+    if (params.has_bias != 0) value += bias[output_index];
+    output[output_index] = value;
+}
+
+kernel void metal_gevm_q5_k_f32(
+        device const uchar * weight [[buffer(0)]],
+        device const float * activation [[buffer(1)]],
+        device const float * bias [[buffer(2)]],
+        device float * output [[buffer(3)]],
+        constant MetalQuantizedProductParams & params [[buffer(4)]],
+        uint output_index [[thread_position_in_grid]]) {
+    if (output_index >= params.n) return;
+    float value = dot_q5_k_f32(
         weight + output_index * params.weight_row_bytes,
         activation, params.k) * params.scale;
     if (params.has_bias != 0) value += bias[output_index];
@@ -998,6 +1141,356 @@ kernel void metal_embedding_q6_k_f32(
     }
     output[index] = q6_k_value(
         embedding + uint(token) * params.weight_row_bytes, col);
+}
+
+// Qwen3.5/3.6 packs each attention head as [query, output_gate]. Materialize
+// two conventional row-major matrices so the following norm, RoPE and gate
+// kernels can remain ordinary standalone operators.
+kernel void metal_split_interleaved_q_gate_f32(
+        device const float * input [[buffer(0)]],
+        device float * query [[buffer(1)]],
+        device float * gate [[buffer(2)]],
+        constant MetalSplitQGateParams & params [[buffer(3)]],
+        uint index [[thread_position_in_grid]]) {
+    const uint output_cols = params.head_count * params.head_dim;
+    const uint total = params.rows * output_cols;
+    if (index >= total || params.head_dim == 0) return;
+    const uint row = index / output_cols;
+    const uint col = index - row * output_cols;
+    const uint head = col / params.head_dim;
+    const uint local = col - head * params.head_dim;
+    const uint input_cols = output_cols * 2;
+    const uint source = row * input_cols + head * params.head_dim * 2 + local;
+    query[index] = input[source];
+    gate[index] = input[source + params.head_dim];
+}
+
+kernel void metal_sigmoid_f32(
+        device const float * input [[buffer(0)]],
+        device float * output [[buffer(1)]],
+        constant MetalElementwiseParams & params [[buffer(2)]],
+        uint index [[thread_position_in_grid]]) {
+    const uint total = params.rows * params.cols;
+    if (index >= total) return;
+    const float value = input[index];
+    output[index] = value >= 0.0f
+        ? 1.0f / (1.0f + exp(-value))
+        : exp(value) / (1.0f + exp(value));
+}
+
+kernel void metal_silu_only_f32(
+        device const float * input [[buffer(0)]],
+        device float * output [[buffer(1)]],
+        constant MetalElementwiseParams & params [[buffer(2)]],
+        uint index [[thread_position_in_grid]]) {
+    const uint total = params.rows * params.cols;
+    if (index >= total) return;
+    const float value = input[index];
+    const float sigmoid = value >= 0.0f
+        ? 1.0f / (1.0f + exp(-value))
+        : exp(value) / (1.0f + exp(value));
+    output[index] = value * sigmoid;
+}
+
+kernel void metal_softplus_f32(
+        device const float * input [[buffer(0)]],
+        device float * output [[buffer(1)]],
+        constant MetalElementwiseParams & params [[buffer(2)]],
+        uint index [[thread_position_in_grid]]) {
+    const uint total = params.rows * params.cols;
+    if (index >= total) return;
+    const float value = input[index];
+    output[index] = value > 20.0f
+        ? value
+        : (value < -20.0f ? exp(value) : log(1.0f + exp(value)));
+}
+
+kernel void metal_exp_f32(
+        device const float * input [[buffer(0)]],
+        device float * output [[buffer(1)]],
+        constant MetalElementwiseParams & params [[buffer(2)]],
+        uint index [[thread_position_in_grid]]) {
+    const uint total = params.rows * params.cols;
+    if (index < total) output[index] = exp(input[index]);
+}
+
+kernel void metal_mul_f32(
+        device const float * left [[buffer(0)]],
+        device const float * right [[buffer(1)]],
+        device float * output [[buffer(2)]],
+        constant MetalElementwiseParams & params [[buffer(3)]],
+        uint index [[thread_position_in_grid]]) {
+    const uint total = params.rows * params.cols;
+    if (index < total) output[index] = left[index] * right[index];
+}
+
+kernel void metal_add_channel_bias_f32(
+        device const float * input [[buffer(0)]],
+        device const float * channel [[buffer(1)]],
+        device float * output [[buffer(2)]],
+        constant MetalBroadcastParams & params [[buffer(3)]],
+        uint index [[thread_position_in_grid]]) {
+    const uint total = params.rows * params.cols;
+    if (index < total) output[index] = input[index] + channel[index % params.cols];
+}
+
+kernel void metal_mul_channel_f32(
+        device const float * input [[buffer(0)]],
+        device const float * channel [[buffer(1)]],
+        device float * output [[buffer(2)]],
+        constant MetalBroadcastParams & params [[buffer(3)]],
+        uint index [[thread_position_in_grid]]) {
+    const uint total = params.rows * params.cols;
+    if (index < total) output[index] = input[index] * channel[index % params.cols];
+}
+
+kernel void metal_row_scale_selected_f32(
+        device const float * input [[buffer(0)]],
+        device const float * row_weights [[buffer(1)]],
+        device float * output [[buffer(2)]],
+        constant MetalRowScaleParams & params [[buffer(3)]],
+        uint index [[thread_position_in_grid]]) {
+    const uint total = params.rows * params.cols;
+    if (index >= total) return;
+    const uint row = index / params.cols;
+    output[index] = input[index] *
+        row_weights[row * params.weight_stride + params.weight_column];
+}
+
+// One threadgroup normalizes one [token, head] vector. input_token_stride
+// permits Q/K to remain views into the wider convolved QKV matrix.
+kernel void metal_l2norm_heads_f32(
+        device const float * input [[buffer(0)]],
+        device float * output [[buffer(1)]],
+        constant MetalHeadNormParams & params [[buffer(2)]],
+        uint local_index [[thread_index_in_threadgroup]],
+        uint3 group_id [[threadgroup_position_in_grid]]) {
+    const uint vector_index = group_id.x;
+    const uint vector_count = params.tokens * params.head_count;
+    if (vector_index >= vector_count) return;
+    const uint token = vector_index / params.head_count;
+    const uint head = vector_index - token * params.head_count;
+    const uint source = token * params.input_token_stride +
+                        head * params.head_dim;
+    const uint destination = vector_index * params.head_dim;
+
+    threadgroup float partial[MYLLM_ELEMENTWISE_THREADS];
+    float local_sum = 0.0f;
+    for (uint dim = local_index; dim < params.head_dim;
+         dim += MYLLM_ELEMENTWISE_THREADS) {
+        const float value = input[source + dim];
+        local_sum += value * value;
+    }
+    partial[local_index] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = MYLLM_ELEMENTWISE_THREADS / 2; stride > 0;
+         stride >>= 1) {
+        if (local_index < stride) {
+            partial[local_index] += partial[local_index + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float inverse_norm = rsqrt(partial[0] + params.epsilon);
+    for (uint dim = local_index; dim < params.head_dim;
+         dim += MYLLM_ELEMENTWISE_THREADS) {
+        output[destination + dim] = input[source + dim] * inverse_norm;
+    }
+}
+
+// The logical convolution input is [old history, projected QKV]. Each channel
+// has its own short kernel and therefore maps cleanly to one output thread.
+kernel void metal_depthwise_conv1d_causal_f32(
+        device const float * input [[buffer(0)]],
+        device const float * history [[buffer(1)]],
+        device const float * weight [[buffer(2)]],
+        device float * output [[buffer(3)]],
+        constant MetalDepthwiseConvParams & params [[buffer(4)]],
+        uint index [[thread_position_in_grid]]) {
+    const uint total = params.tokens * params.channels;
+    if (index >= total || params.kernel_size == 0) return;
+    const uint token = index / params.channels;
+    const uint channel = index - token * params.channels;
+    const uint history_rows = params.kernel_size - 1;
+    float accumulator = 0.0f;
+    for (uint tap = 0; tap < params.kernel_size; ++tap) {
+        const uint concat_row = token + tap;
+        const float value = concat_row < history_rows
+            ? history[concat_row * params.channels + channel]
+            : input[(concat_row - history_rows) * params.channels + channel];
+        accumulator += value * weight[channel * params.kernel_size + tap];
+    }
+    output[index] = accumulator;
+}
+
+// One thread owns a channel so all old history values are captured before the
+// same buffer is overwritten. This makes the update race-free for decode.
+kernel void metal_conv_history_commit_f32(
+        device const float * input [[buffer(0)]],
+        device float * history [[buffer(1)]],
+        constant MetalDepthwiseConvParams & params [[buffer(2)]],
+        uint channel [[thread_position_in_grid]]) {
+    if (channel >= params.channels || params.kernel_size < 2 ||
+        params.kernel_size > 9) return;
+    const uint history_rows = params.kernel_size - 1;
+    float old_values[8];
+    for (uint row = 0; row < history_rows; ++row) {
+        old_values[row] = history[row * params.channels + channel];
+    }
+    for (uint row = 0; row < history_rows; ++row) {
+        const uint concat_row = params.tokens + row;
+        history[row * params.channels + channel] =
+            concat_row < history_rows
+                ? old_values[concat_row]
+                : input[(concat_row - history_rows) * params.channels +
+                        channel];
+    }
+}
+
+// Stateful DeltaNet scan. A thread owns one state column for one value head,
+// while token order remains serial. Qwen3.5/3.6 interleaves the repeated Q/K
+// heads, so value head h reads Q/K head (h % key_head_count).
+kernel void metal_gdn_recurrence_f32(
+        device const float * query [[buffer(0)]],
+        device const float * key [[buffer(1)]],
+        device const float * value [[buffer(2)]],
+        device const float * decay [[buffer(3)]],
+        device const float * beta [[buffer(4)]],
+        device float * state [[buffer(5)]],
+        device float * output [[buffer(6)]],
+        constant MetalGdnParams & params [[buffer(7)]],
+        uint local_index [[thread_index_in_threadgroup]],
+        uint3 group_id [[threadgroup_position_in_grid]]) {
+    const uint value_head = group_id.x;
+    const uint column = local_index;
+    if (value_head >= params.value_head_count ||
+        column >= params.head_dim || params.key_head_count == 0) return;
+    const uint key_head = value_head % params.key_head_count;
+    const uint state_head = value_head * params.head_dim * params.head_dim;
+    const float query_scale = rsqrt(float(params.head_dim));
+
+    for (uint token = 0; token < params.tokens; ++token) {
+        const uint q_base = token * params.q_stride +
+                            key_head * params.head_dim;
+        const uint k_base = token * params.k_stride +
+                            key_head * params.head_dim;
+        const uint v_base = token * params.v_stride +
+                            value_head * params.head_dim;
+        const float decay_value =
+            decay[token * params.value_head_count + value_head];
+
+        float prediction = 0.0f;
+        for (uint row = 0; row < params.head_dim; ++row) {
+            const uint state_index = state_head + row * params.head_dim + column;
+            const float decayed_state = state[state_index] * decay_value;
+            state[state_index] = decayed_state;
+            prediction += decayed_state * key[k_base + row];
+        }
+
+        const float delta = beta[token * params.value_head_count + value_head] *
+            (value[v_base + column] - prediction);
+        float result = 0.0f;
+        for (uint row = 0; row < params.head_dim; ++row) {
+            const uint state_index = state_head + row * params.head_dim + column;
+            const float updated = state[state_index] +
+                key[k_base + row] * delta;
+            state[state_index] = updated;
+            result += updated * query[q_base + row] * query_scale;
+        }
+        output[token * params.output_stride +
+               value_head * params.head_dim + column] = result;
+    }
+}
+
+// Router softmax is computed separately. This kernel performs a deterministic
+// top-k insertion scan for every row and keeps lower expert ids on exact ties.
+kernel void metal_topk_f32(
+        device const float * input [[buffer(0)]],
+        device uint * indices [[buffer(1)]],
+        device float * values [[buffer(2)]],
+        constant MetalTopKParams & params [[buffer(3)]],
+        uint row [[thread_position_in_grid]]) {
+    if (row >= params.rows || params.k == 0 || params.k > 8) return;
+    float best_values[8];
+    uint best_indices[8];
+    for (uint rank = 0; rank < 8; ++rank) {
+        best_values[rank] = -INFINITY;
+        best_indices[rank] = 0xffffffffu;
+    }
+    for (uint col = 0; col < params.cols; ++col) {
+        const float candidate = input[row * params.cols + col];
+        uint insertion = params.k;
+        for (uint rank = 0; rank < params.k; ++rank) {
+            if (candidate > best_values[rank]) {
+                insertion = rank;
+                break;
+            }
+        }
+        if (insertion < params.k) {
+            for (uint rank = params.k - 1; rank > insertion; --rank) {
+                best_values[rank] = best_values[rank - 1];
+                best_indices[rank] = best_indices[rank - 1];
+            }
+            best_values[insertion] = candidate;
+            best_indices[insertion] = col;
+        }
+    }
+    for (uint rank = 0; rank < params.k; ++rank) {
+        indices[row * params.k + rank] = best_indices[rank];
+        values[row * params.k + rank] = best_values[rank];
+    }
+}
+
+kernel void metal_topk_renorm_f32(
+        device float * values [[buffer(0)]],
+        constant MetalTopKParams & params [[buffer(1)]],
+        uint row [[thread_position_in_grid]]) {
+    if (row >= params.rows || params.k == 0) return;
+    float sum = 0.0f;
+    for (uint rank = 0; rank < params.k; ++rank) {
+        sum += values[row * params.k + rank];
+    }
+    const float inverse = sum > 0.0f ? 1.0f / sum : 0.0f;
+    for (uint rank = 0; rank < params.k; ++rank) {
+        values[row * params.k + rank] *= inverse;
+    }
+}
+
+kernel void metal_expert_gemm_q4_k_f32(
+        device const float * activation [[buffer(0)]],
+        device const uchar * weights [[buffer(1)]],
+        device const uint * expert_ids [[buffer(2)]],
+        device float * output [[buffer(3)]],
+        constant MetalExpertProductParams & params [[buffer(4)]],
+        uint2 position [[thread_position_in_grid]]) {
+    const uint col = position.x;
+    const uint row = position.y;
+    if (row >= params.rows || col >= params.output_size) return;
+    const uint expert = expert_ids[
+        row * params.route_stride + params.route_index];
+    device const uchar * weight_row = weights +
+        expert * params.expert_stride_bytes + col * params.weight_row_bytes;
+    output[row * params.output_size + col] = dot_q4_k_f32_packed_reuse(
+        weight_row, activation + row * params.activation_stride,
+        params.input_size);
+}
+
+kernel void metal_expert_gemm_q6_k_f32(
+        device const float * activation [[buffer(0)]],
+        device const uchar * weights [[buffer(1)]],
+        device const uint * expert_ids [[buffer(2)]],
+        device float * output [[buffer(3)]],
+        constant MetalExpertProductParams & params [[buffer(4)]],
+        uint2 position [[thread_position_in_grid]]) {
+    const uint col = position.x;
+    const uint row = position.y;
+    if (row >= params.rows || col >= params.output_size) return;
+    const uint expert = expert_ids[
+        row * params.route_stride + params.route_index];
+    device const uchar * weight_row = weights +
+        expert * params.expert_stride_bytes + col * params.weight_row_bytes;
+    output[row * params.output_size + col] = dot_q6_k_f32(
+        weight_row, activation + row * params.activation_stride,
+        params.input_size);
 }
 
 // Greedy selection is kept on the device so a generation step returns only a

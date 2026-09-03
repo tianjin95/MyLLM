@@ -1120,6 +1120,7 @@ MemoryStats CPULLM::memory_stats() const noexcept {
     return {
         static_cast<uint64_t>(impl_->config.dequantized_bytes),
         kv_cache_bytes,
+        0,
         estimate_activation_bytes(impl_->config, impl_->max_sequence),
         true,
     };

@@ -1,6 +1,8 @@
 #include "metal_model.h"
 
+#include <algorithm>
 #include <cmath>
+#include <cerrno>
 #include <cstring>
 #include <fstream>
 #include <limits>
@@ -10,6 +12,11 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/types.h>
+#include <unistd.h>
 
 namespace llm {
 namespace {
@@ -356,6 +363,7 @@ bool is_known_type(std::uint32_t value) {
     case MetalGgmlType::Q4_K:
     case MetalGgmlType::Q5_K:
     case MetalGgmlType::Q6_K:
+    case MetalGgmlType::BF16:
         return true;
     }
     return false;
@@ -378,6 +386,7 @@ const char* metal_ggml_type_name(MetalGgmlType type) noexcept {
     case MetalGgmlType::Q4_K: return "Q4_K";
     case MetalGgmlType::Q5_K: return "Q5_K";
     case MetalGgmlType::Q6_K: return "Q6_K";
+    case MetalGgmlType::BF16: return "BF16";
     }
     return "UNKNOWN";
 }
@@ -386,6 +395,7 @@ std::size_t metal_ggml_block_size(MetalGgmlType type) {
     switch (type) {
     case MetalGgmlType::F32:
     case MetalGgmlType::F16:
+    case MetalGgmlType::BF16:
         return 1;
     case MetalGgmlType::Q4_0:
     case MetalGgmlType::Q4_1:
@@ -419,6 +429,7 @@ std::size_t metal_ggml_type_size(MetalGgmlType type) {
     case MetalGgmlType::Q4_K: return 144;
     case MetalGgmlType::Q5_K: return 176;
     case MetalGgmlType::Q6_K: return 210;
+    case MetalGgmlType::BF16: return 2;
     }
     throw std::runtime_error("unsupported GGML tensor type");
 }
@@ -536,26 +547,84 @@ struct MetalRawModel::Impl {
 
         initialize_config();
         loaded_tensors.reserve(tensors.size());
+
+        file_descriptor = ::open(path.c_str(), O_RDONLY);
+        if (file_descriptor < 0) {
+            throw std::runtime_error(
+                "cannot open GGUF for ranged reads: " + path + ": " +
+                std::strerror(errno));
+        }
+        void* mapping = ::mmap(
+            nullptr, file_size, PROT_READ, MAP_PRIVATE, file_descriptor, 0);
+        if (mapping != MAP_FAILED) {
+            mapped_file = static_cast<const std::uint8_t*>(mapping);
+        }
+    }
+
+    ~Impl() {
+        if (mapped_file != nullptr) {
+            ::munmap(const_cast<std::uint8_t*>(mapped_file), file_size);
+        }
+        if (file_descriptor >= 0) {
+            ::close(file_descriptor);
+        }
     }
 
     void initialize_config() {
         config.architecture = metadata.text("general.architecture");
-        if (config.architecture != "qwen2") {
+        if (config.architecture != "qwen2" &&
+            config.architecture != "qwen35moe") {
             throw std::runtime_error(
-                "MetalRawModel currently supports qwen2 GGUF models, got " +
+                "MetalRawModel does not support GGUF architecture " +
                 config.architecture);
         }
         config.tensor_count = tensors.size();
-        config.layer_count = metadata_size(metadata, "qwen2.block_count");
+        const std::string prefix = config.architecture + ".";
+        config.total_layer_count = metadata_size(
+            metadata, (prefix + "block_count").c_str());
+        config.nextn_layer_count = config.architecture == "qwen35moe"
+            ? static_cast<std::size_t>(metadata.integer(
+                  prefix + "nextn_predict_layers", 0))
+            : 0;
+        if (config.nextn_layer_count >= config.total_layer_count) {
+            throw std::runtime_error("invalid optional NextN/MTP layer count");
+        }
+        config.layer_count =
+            config.total_layer_count - config.nextn_layer_count;
         config.embedding_size = metadata_size(
-            metadata, "qwen2.embedding_length");
-        config.feed_forward_size = metadata_size(
-            metadata, "qwen2.feed_forward_length");
+            metadata, (prefix + "embedding_length").c_str());
         config.attention_head_count = metadata_size(
-            metadata, "qwen2.attention.head_count");
+            metadata, (prefix + "attention.head_count").c_str());
         config.kv_head_count = metadata_size(
-            metadata, "qwen2.attention.head_count_kv");
-        config.context_length = metadata_size(metadata, "qwen2.context_length");
+            metadata, (prefix + "attention.head_count_kv").c_str());
+        config.context_length = metadata_size(
+            metadata, (prefix + "context_length").c_str());
+        if (config.architecture == "qwen2") {
+            config.feed_forward_size = metadata_size(
+                metadata, "qwen2.feed_forward_length");
+        } else {
+            config.expert_count = metadata_size(
+                metadata, "qwen35moe.expert_count");
+            config.expert_used_count = metadata_size(
+                metadata, "qwen35moe.expert_used_count");
+            config.expert_feed_forward_size = metadata_size(
+                metadata, "qwen35moe.expert_feed_forward_length");
+            config.shared_expert_feed_forward_size = metadata_size(
+                metadata, "qwen35moe.expert_shared_feed_forward_length");
+            config.feed_forward_size = config.expert_feed_forward_size;
+            config.full_attention_interval = metadata_size(
+                metadata, "qwen35moe.full_attention_interval");
+            config.ssm_conv_kernel = metadata_size(
+                metadata, "qwen35moe.ssm.conv_kernel");
+            config.ssm_state_size = metadata_size(
+                metadata, "qwen35moe.ssm.state_size");
+            config.ssm_group_count = metadata_size(
+                metadata, "qwen35moe.ssm.group_count");
+            config.ssm_time_step_rank = metadata_size(
+                metadata, "qwen35moe.ssm.time_step_rank");
+            config.ssm_inner_size = metadata_size(
+                metadata, "qwen35moe.ssm.inner_size");
+        }
         config.vocabulary_size = metadata.vocabulary.size();
         if (config.vocabulary_size == 0) {
             config.vocabulary_size = metadata_size(
@@ -565,21 +634,34 @@ struct MetalRawModel::Impl {
         config.merges = metadata.merges;
         config.tokenizer_pre = metadata.text("tokenizer.ggml.pre");
 
-        if (config.embedding_size % config.attention_head_count != 0) {
-            throw std::runtime_error(
-                "embedding size must be divisible by attention head count");
-        }
         if (config.attention_head_count % config.kv_head_count != 0) {
             throw std::runtime_error(
                 "attention head count must be divisible by KV head count");
         }
-        config.head_size =
-            config.embedding_size / config.attention_head_count;
-        config.rotary_dimension = config.head_size;
+        if (config.architecture == "qwen2") {
+            if (config.embedding_size % config.attention_head_count != 0) {
+                throw std::runtime_error(
+                    "embedding size must be divisible by attention head count");
+            }
+            config.head_size =
+                config.embedding_size / config.attention_head_count;
+            config.rotary_dimension = config.head_size;
+        } else {
+            config.head_size = metadata_size(
+                metadata, "qwen35moe.attention.key_length");
+            const std::size_t value_size = metadata_size(
+                metadata, "qwen35moe.attention.value_length");
+            if (value_size != config.head_size) {
+                throw std::runtime_error(
+                    "qwen35moe key/value head dimensions differ");
+            }
+            config.rotary_dimension = metadata_size(
+                metadata, "qwen35moe.rope.dimension_count");
+        }
         config.rope_theta = static_cast<float>(
-            metadata.real("qwen2.rope.freq_base", 1000000.0));
+            metadata.real(prefix + "rope.freq_base", 1000000.0));
         config.norm_epsilon = static_cast<float>(metadata.real(
-            "qwen2.attention.layer_norm_rms_epsilon", 1e-6));
+            prefix + "attention.layer_norm_rms_epsilon", 1e-6));
         if (!std::isfinite(config.rope_theta) || config.rope_theta <= 0.0f ||
             !std::isfinite(config.norm_epsilon) ||
             config.norm_epsilon <= 0.0f) {
@@ -658,6 +740,90 @@ struct MetalRawModel::Impl {
         return result;
     }
 
+    RawTensorDescriptor describe(const std::string& name,
+                                 std::size_t expected_rows,
+                                 std::size_t expected_cols) {
+        const TensorInfo& tensor = require(name);
+        validate_shape(tensor, expected_rows, expected_cols);
+        if (loaded_tensors.find(name) != loaded_tensors.end()) {
+            throw std::runtime_error("tensor consumed more than once: " + name);
+        }
+        loaded_tensors.insert(name);
+        return {
+            tensor.name,
+            tensor.type,
+            tensor.dimensions,
+            tensor.rows,
+            tensor.cols,
+            tensor.row_bytes,
+            tensor.data_offset,
+            tensor.byte_size,
+        };
+    }
+
+    void read_slice(const RawTensorDescriptor& descriptor,
+                    std::size_t relative_offset,
+                    void* destination,
+                    std::size_t bytes) const {
+        const TensorInfo& tensor = require(descriptor.name);
+        if (descriptor.type != tensor.type ||
+            descriptor.dimensions != tensor.dimensions ||
+            descriptor.rows != tensor.rows || descriptor.cols != tensor.cols ||
+            descriptor.row_bytes != tensor.row_bytes ||
+            descriptor.data_offset != tensor.data_offset ||
+            descriptor.byte_size != tensor.byte_size) {
+            throw std::invalid_argument(
+                "tensor descriptor does not match GGUF index: " +
+                descriptor.name);
+        }
+        if (relative_offset > tensor.byte_size ||
+            bytes > tensor.byte_size - relative_offset) {
+            throw std::out_of_range(
+                "tensor slice is outside GGUF tensor: " + descriptor.name);
+        }
+        if (bytes == 0) return;
+        if (destination == nullptr) {
+            throw std::invalid_argument(
+                "tensor slice destination is null: " + descriptor.name);
+        }
+
+        const std::size_t absolute_offset = checked_add(
+            tensor.data_offset, relative_offset, "GGUF tensor slice offset");
+        if (mapped_file != nullptr) {
+            std::memcpy(destination, mapped_file + absolute_offset, bytes);
+            return;
+        }
+
+        auto* output = static_cast<std::uint8_t*>(destination);
+        std::size_t remaining = bytes;
+        std::size_t offset = absolute_offset;
+        while (remaining != 0) {
+            const std::size_t maximum = static_cast<std::size_t>(
+                std::numeric_limits<ssize_t>::max());
+            const std::size_t chunk = std::min(remaining, maximum);
+            if (offset > static_cast<std::size_t>(
+                             std::numeric_limits<off_t>::max())) {
+                throw std::runtime_error(
+                    "GGUF tensor slice offset does not fit off_t");
+            }
+            const ssize_t read_bytes = ::pread(
+                file_descriptor, output, chunk, static_cast<off_t>(offset));
+            if (read_bytes < 0) {
+                throw std::runtime_error(
+                    "cannot read GGUF tensor slice " + descriptor.name +
+                    ": " + std::strerror(errno));
+            }
+            if (read_bytes == 0) {
+                throw std::runtime_error(
+                    "unexpected EOF while reading tensor slice: " +
+                    descriptor.name);
+            }
+            output += static_cast<std::size_t>(read_bytes);
+            offset += static_cast<std::size_t>(read_bytes);
+            remaining -= static_cast<std::size_t>(read_bytes);
+        }
+    }
+
     std::string path;
     std::ifstream input;
     std::size_t file_size = 0;
@@ -665,7 +831,10 @@ struct MetalRawModel::Impl {
     std::vector<TensorInfo> tensors;
     std::unordered_map<std::string, std::size_t> tensor_index;
     std::unordered_set<std::string> loaded_tensors;
+    std::unordered_set<std::string> ignored_tensors;
     MetalModelConfig config;
+    int file_descriptor = -1;
+    const std::uint8_t* mapped_file = nullptr;
 };
 
 MetalRawModel::MetalRawModel(const std::string& gguf_path)
@@ -695,6 +864,10 @@ RawTensor MetalRawModel::load_output_weight() {
 }
 
 MetalRawLayer MetalRawModel::load_layer(std::size_t layer_index) {
+    if (impl_->config.architecture != "qwen2") {
+        throw std::runtime_error(
+            "qwen2 load_layer called for " + impl_->config.architecture);
+    }
     if (layer_index >= impl_->config.layer_count) {
         throw std::out_of_range("layer index is outside the Metal model");
     }
@@ -736,15 +909,66 @@ MetalRawLayer MetalRawModel::load_layer(std::size_t layer_index) {
     return result;
 }
 
+bool MetalRawModel::has_tensor(const std::string& name) const noexcept {
+    return impl_->tensor_index.find(name) != impl_->tensor_index.end();
+}
+
+RawTensor MetalRawModel::load_tensor(const std::string& name,
+                                     std::size_t expected_rows,
+                                     std::size_t expected_cols) {
+    return impl_->load(name, expected_rows, expected_cols);
+}
+
+RawTensorDescriptor MetalRawModel::describe_tensor(
+    const std::string& name,
+    std::size_t expected_rows,
+    std::size_t expected_cols) {
+    return impl_->describe(name, expected_rows, expected_cols);
+}
+
+void MetalRawModel::read_tensor_slice(
+    const RawTensorDescriptor& tensor,
+    std::size_t relative_offset,
+    void* destination,
+    std::size_t bytes) const {
+    impl_->read_slice(tensor, relative_offset, destination, bytes);
+}
+
+void MetalRawModel::ignore_tensor(const std::string& name) {
+    if (!has_tensor(name)) {
+        throw std::runtime_error("cannot ignore missing tensor: " + name);
+    }
+    if (impl_->loaded_tensors.find(name) != impl_->loaded_tensors.end()) {
+        throw std::runtime_error("cannot ignore loaded tensor: " + name);
+    }
+    impl_->ignored_tensors.insert(name);
+}
+
+void MetalRawModel::ignore_tensor_prefix(const std::string& prefix) {
+    for (const TensorInfo& tensor : impl_->tensors) {
+        if (tensor.name.compare(0, prefix.size(), prefix) == 0) {
+            if (impl_->loaded_tensors.find(tensor.name) !=
+                impl_->loaded_tensors.end()) {
+                throw std::runtime_error(
+                    "cannot ignore loaded tensor: " + tensor.name);
+            }
+            impl_->ignored_tensors.insert(tensor.name);
+        }
+    }
+}
+
 void MetalRawModel::validate_all_tensors_loaded() const {
-    if (impl_->loaded_tensors.size() == impl_->tensors.size()) {
+    if (impl_->loaded_tensors.size() + impl_->ignored_tensors.size() ==
+        impl_->tensors.size()) {
         return;
     }
     std::string message =
         "GGUF contains tensors not mapped by MetalRawModel:";
     for (const TensorInfo& tensor : impl_->tensors) {
         if (impl_->loaded_tensors.find(tensor.name) ==
-            impl_->loaded_tensors.end()) {
+                impl_->loaded_tensors.end() &&
+            impl_->ignored_tensors.find(tensor.name) ==
+                impl_->ignored_tensors.end()) {
             message += " " + tensor.name;
         }
     }

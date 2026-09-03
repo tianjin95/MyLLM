@@ -11,6 +11,9 @@ namespace llm {
 struct MemoryStats {
     std::uint64_t weight_bytes = 0;
     std::uint64_t kv_cache_bytes = 0;
+    // Persistent non-KV sequence state, such as DeltaNet recurrent matrices
+    // and causal-convolution history. Dense Transformer backends leave this 0.
+    std::uint64_t recurrent_state_bytes = 0;
     std::uint64_t intermediate_bytes = 0;
     bool intermediate_is_estimate = false;
 
@@ -20,7 +23,12 @@ struct MemoryStats {
         if (weight_bytes > max_value - kv_cache_bytes) {
             return max_value;
         }
-        const std::uint64_t persistent = weight_bytes + kv_cache_bytes;
+        const std::uint64_t weights_and_kv = weight_bytes + kv_cache_bytes;
+        if (weights_and_kv > max_value - recurrent_state_bytes) {
+            return max_value;
+        }
+        const std::uint64_t persistent =
+            weights_and_kv + recurrent_state_bytes;
         if (persistent > max_value - intermediate_bytes) {
             return max_value;
         }
