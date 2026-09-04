@@ -32,6 +32,9 @@ struct GenerationStats {
     std::size_t decode_steps = 0;
     bool used_gpu = false;
     bool stopped = false;
+    bool has_expert_cache_stats = false;
+    std::uint64_t expert_cache_hits = 0;
+    std::uint64_t expert_cache_misses = 0;
     llm::MemoryStats memory;
 };
 

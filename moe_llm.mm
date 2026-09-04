@@ -8,19 +8,28 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <chrono>
 #include <climits>
 #include <cmath>
+#include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fcntl.h>
 #include <fstream>
+#include <iomanip>
+#include <iostream>
 #include <iterator>
 #include <limits>
 #include <mach-o/dyld.h>
 #include <memory>
+#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <utility>
 #include <vector>
 
@@ -29,7 +38,35 @@ namespace {
 
 constexpr std::uint32_t kTileSize = 16;
 constexpr std::uint32_t kReductionThreads = 256;
+constexpr std::uint32_t kArgmaxElementsPerGroup = 1024;
 constexpr std::size_t kDefaultMoeContext = 1024;
+constexpr std::uint32_t kExpertBundleVersion = 1;
+constexpr std::array<char, 8> kExpertBundleMagic{
+    {'M', 'Y', 'L', 'L', 'M', 'E', 'X', '1'}};
+
+struct ExpertBundleHeader {
+    char magic[8]{};
+    std::uint32_t version = 0;
+    std::uint32_t header_bytes = 0;
+    std::uint64_t model_size = 0;
+    std::int64_t model_mtime_seconds = 0;
+    std::int64_t model_mtime_nanoseconds = 0;
+    std::uint32_t layer_count = 0;
+    std::uint32_t expert_count = 0;
+    std::uint64_t entry_count = 0;
+    std::uint64_t index_offset = 0;
+    std::uint64_t data_offset = 0;
+};
+
+struct ExpertBundleEntry {
+    std::uint64_t offset = 0;
+    std::uint64_t size = 0;
+    std::uint32_t ready = 0;
+    std::uint32_t reserved = 0;
+};
+
+static_assert(sizeof(ExpertBundleHeader) == 72);
+static_assert(sizeof(ExpertBundleEntry) == 24);
 
 struct MetalMatmulParamsHost {
     std::uint32_t m = 0;
@@ -99,10 +136,11 @@ struct MetalKVCacheWriteParamsHost {
 struct MetalKVCacheQKParamsHost {
     std::uint32_t query_rows = 0;
     std::uint32_t key_length = 0;
+    std::uint32_t query_heads = 0;
+    std::uint32_t kv_heads = 0;
     std::uint32_t cache_stride = 0;
     std::uint32_t query_stride = 0;
     std::uint32_t head_dim = 0;
-    std::uint32_t cache_head = 0;
     std::uint32_t query_position = 0;
     float scale = 1.0f;
 };
@@ -110,16 +148,17 @@ struct MetalKVCacheQKParamsHost {
 struct MetalKVCacheAVParamsHost {
     std::uint32_t query_rows = 0;
     std::uint32_t key_length = 0;
+    std::uint32_t query_heads = 0;
+    std::uint32_t kv_heads = 0;
     std::uint32_t cache_stride = 0;
     std::uint32_t score_stride = 0;
     std::uint32_t head_dim = 0;
-    std::uint32_t cache_head = 0;
     std::uint32_t output_stride = 0;
-    std::uint32_t output_offset = 0;
 };
 
 struct MetalArgmaxParamsHost {
     std::uint32_t length = 0;
+    std::uint32_t elements_per_group = 0;
 };
 
 struct MetalSplitQGateParamsHost {
@@ -172,14 +211,20 @@ struct MetalTopKParamsHost {
 };
 
 struct MetalExpertProductParamsHost {
-    std::uint32_t rows = 0;
+    std::uint32_t tokens = 0;
+    std::uint32_t routes = 0;
     std::uint32_t output_size = 0;
     std::uint32_t input_size = 0;
     std::uint32_t activation_stride = 0;
     std::uint32_t weight_row_bytes = 0;
     std::uint32_t expert_stride_bytes = 0;
-    std::uint32_t route_stride = 0;
-    std::uint32_t route_index = 0;
+    std::uint32_t activation_is_routed = 0;
+};
+
+struct MetalExpertWeightedReduceParamsHost {
+    std::uint32_t tokens = 0;
+    std::uint32_t routes = 0;
+    std::uint32_t cols = 0;
 };
 
 static_assert(sizeof(MetalMatmulParamsHost) == 36);
@@ -190,9 +235,9 @@ static_assert(sizeof(MetalRmsNormParamsHost) == 12);
 static_assert(sizeof(MetalRopeHeadsParamsHost) == 24);
 static_assert(sizeof(MetalEmbeddingParamsHost) == 16);
 static_assert(sizeof(MetalKVCacheWriteParamsHost) == 16);
-static_assert(sizeof(MetalKVCacheQKParamsHost) == 32);
+static_assert(sizeof(MetalKVCacheQKParamsHost) == 36);
 static_assert(sizeof(MetalKVCacheAVParamsHost) == 32);
-static_assert(sizeof(MetalArgmaxParamsHost) == 4);
+static_assert(sizeof(MetalArgmaxParamsHost) == 8);
 static_assert(sizeof(MetalSplitQGateParamsHost) == 12);
 static_assert(sizeof(MetalBroadcastParamsHost) == 8);
 static_assert(sizeof(MetalRowScaleParamsHost) == 16);
@@ -201,6 +246,7 @@ static_assert(sizeof(MetalDepthwiseConvParamsHost) == 12);
 static_assert(sizeof(MetalGdnParamsHost) == 32);
 static_assert(sizeof(MetalTopKParamsHost) == 12);
 static_assert(sizeof(MetalExpertProductParamsHost) == 32);
+static_assert(sizeof(MetalExpertWeightedReduceParamsHost) == 12);
 
 std::size_t checked_mul(std::size_t left,
                         std::size_t right,
@@ -244,6 +290,104 @@ std::uint64_t monotonic_ns() {
     return static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+struct FileIdentity {
+    std::uint64_t size = 0;
+    std::int64_t mtime_seconds = 0;
+    std::int64_t mtime_nanoseconds = 0;
+};
+
+bool query_file_identity(const std::filesystem::path& path,
+                         FileIdentity& identity) noexcept {
+    struct stat status {};
+    if (::stat(path.c_str(), &status) != 0 || status.st_size < 0) return false;
+    identity.size = static_cast<std::uint64_t>(status.st_size);
+#if defined(__APPLE__)
+    identity.mtime_seconds = status.st_mtimespec.tv_sec;
+    identity.mtime_nanoseconds = status.st_mtimespec.tv_nsec;
+#else
+    identity.mtime_seconds = status.st_mtim.tv_sec;
+    identity.mtime_nanoseconds = status.st_mtim.tv_nsec;
+#endif
+    return true;
+}
+
+bool read_all_at(int descriptor,
+                 void* destination,
+                 std::size_t bytes,
+                 std::uint64_t offset) noexcept {
+    auto* output = static_cast<std::uint8_t*>(destination);
+    while (bytes != 0) {
+        if (offset > static_cast<std::uint64_t>(
+                         std::numeric_limits<off_t>::max())) {
+            return false;
+        }
+        const std::size_t maximum = static_cast<std::size_t>(
+            std::numeric_limits<ssize_t>::max());
+        const std::size_t chunk = std::min(bytes, maximum);
+        const ssize_t count = ::pread(
+            descriptor, output, chunk, static_cast<off_t>(offset));
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) return false;
+        const std::size_t consumed = static_cast<std::size_t>(count);
+        output += consumed;
+        bytes -= consumed;
+        offset += consumed;
+    }
+    return true;
+}
+
+bool write_all_at(int descriptor,
+                  const void* source,
+                  std::size_t bytes,
+                  std::uint64_t offset) noexcept {
+    const auto* input = static_cast<const std::uint8_t*>(source);
+    while (bytes != 0) {
+        if (offset > static_cast<std::uint64_t>(
+                         std::numeric_limits<off_t>::max())) {
+            return false;
+        }
+        const std::size_t maximum = static_cast<std::size_t>(
+            std::numeric_limits<ssize_t>::max());
+        const std::size_t chunk = std::min(bytes, maximum);
+        const ssize_t count = ::pwrite(
+            descriptor, input, chunk, static_cast<off_t>(offset));
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) return false;
+        const std::size_t consumed = static_cast<std::size_t>(count);
+        input += consumed;
+        bytes -= consumed;
+        offset += consumed;
+    }
+    return true;
+}
+
+std::uint64_t fnv1a_append(std::uint64_t hash,
+                           const void* data,
+                           std::size_t bytes) noexcept {
+    const auto* input = static_cast<const std::uint8_t*>(data);
+    for (std::size_t index = 0; index < bytes; ++index) {
+        hash ^= input[index];
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
+std::string model_fingerprint(const std::filesystem::path& path,
+                              const FileIdentity& identity) {
+    std::error_code error;
+    std::filesystem::path normalized = std::filesystem::weakly_canonical(
+        path, error);
+    if (error) normalized = std::filesystem::absolute(path, error);
+    if (error) normalized = path.lexically_normal();
+    const std::string name = normalized.string();
+    std::uint64_t hash = 1469598103934665603ull;
+    hash = fnv1a_append(hash, name.data(), name.size());
+    hash = fnv1a_append(hash, &identity, sizeof(identity));
+    std::ostringstream result;
+    result << std::hex << std::setfill('0') << std::setw(16) << hash;
+    return result.str();
 }
 
 std::string read_text_file(const std::filesystem::path& path) {
@@ -411,10 +555,13 @@ struct MoeLLM::Impl {
         ExpertGate,
         ExpertUp,
         ExpertActivation,
+        ExpertDown,
         RouteIds,
         RouteWeights,
         Scores,
         Logits,
+        ArgmaxValues,
+        ArgmaxIndices,
         Count,
     };
 
@@ -443,6 +590,40 @@ struct MoeLLM::Impl {
         std::uint64_t threadgroups = 0;
         std::uint64_t dispatched_threads = 0;
         std::uint64_t one_group_kernels = 0;
+    };
+
+    struct ExpertBundleSidecar {
+        int descriptor = -1;
+        std::filesystem::path path;
+        ExpertBundleHeader header;
+        std::vector<ExpertBundleEntry> entries;
+        std::uint64_t append_offset = 0;
+        std::vector<std::uint8_t> scratch;
+        const std::uint8_t* mapping = nullptr;
+        std::size_t mapping_size = 0;
+
+        ~ExpertBundleSidecar() {
+            if (mapping != nullptr) {
+                ::munmap(const_cast<std::uint8_t*>(mapping), mapping_size);
+            }
+            if (descriptor >= 0) ::close(descriptor);
+        }
+
+        bool enabled() const noexcept { return descriptor >= 0; }
+
+        void disable() noexcept {
+            if (mapping != nullptr) {
+                ::munmap(const_cast<std::uint8_t*>(mapping), mapping_size);
+            }
+            mapping = nullptr;
+            mapping_size = 0;
+            if (descriptor >= 0) ::close(descriptor);
+            descriptor = -1;
+            path.clear();
+            header = {};
+            entries.clear();
+            append_offset = 0;
+        }
     };
 
     id<MTLDevice> device = nil;
@@ -474,7 +655,8 @@ struct MoeLLM::Impl {
     id<MTLComputePipelineState> kv_write = nil;
     id<MTLComputePipelineState> kv_qk = nil;
     id<MTLComputePipelineState> kv_av = nil;
-    id<MTLComputePipelineState> argmax = nil;
+    id<MTLComputePipelineState> argmax_partial = nil;
+    id<MTLComputePipelineState> argmax_finalize = nil;
     id<MTLComputePipelineState> split_q_gate = nil;
     id<MTLComputePipelineState> sigmoid = nil;
     id<MTLComputePipelineState> silu = nil;
@@ -492,6 +674,7 @@ struct MoeLLM::Impl {
     id<MTLComputePipelineState> topk_renorm = nil;
     id<MTLComputePipelineState> expert_q4_k = nil;
     id<MTLComputePipelineState> expert_q6_k = nil;
+    id<MTLComputePipelineState> expert_weighted_reduce = nil;
 
     std::string device_name;
     MetalModelConfig config;
@@ -509,6 +692,9 @@ struct MoeLLM::Impl {
     std::size_t capacity = 0;
     std::size_t sequence_length = 0;
     std::size_t expert_cache_count = 0;
+    std::uint64_t turn_expert_cache_hits = 0;
+    std::uint64_t turn_expert_cache_misses = 0;
+    ExpertBundleSidecar expert_sidecar;
     std::unique_ptr<Profiler> profiler;
     std::unique_ptr<MetalProfiler> metal_profiler;
 
@@ -579,7 +765,8 @@ struct MoeLLM::Impl {
             MYLLM_PIPELINE(kv_write, "metal_kv_cache_write_f32");
             MYLLM_PIPELINE(kv_qk, "metal_kv_cache_qk_f32");
             MYLLM_PIPELINE(kv_av, "metal_kv_cache_av_f32");
-            MYLLM_PIPELINE(argmax, "metal_argmax_f32");
+            MYLLM_PIPELINE(argmax_partial, "metal_argmax_partial_f32");
+            MYLLM_PIPELINE(argmax_finalize, "metal_argmax_finalize_f32");
             MYLLM_PIPELINE(split_q_gate,
                            "metal_split_interleaved_q_gate_f32");
             MYLLM_PIPELINE(sigmoid, "metal_sigmoid_f32");
@@ -600,6 +787,8 @@ struct MoeLLM::Impl {
             MYLLM_PIPELINE(topk_renorm, "metal_topk_renorm_f32");
             MYLLM_PIPELINE(expert_q4_k, "metal_expert_gemm_q4_k_f32");
             MYLLM_PIPELINE(expert_q6_k, "metal_expert_gemm_q6_k_f32");
+            MYLLM_PIPELINE(expert_weighted_reduce,
+                           "metal_expert_weighted_reduce_f32");
 #undef MYLLM_PIPELINE
         }
     }
@@ -607,7 +796,8 @@ struct MoeLLM::Impl {
     void require_available() const {
         if (device == nil || queue == nil || gemm_f32 == nil ||
             gevm_f32 == nil || gdn == nil || expert_q4_k == nil ||
-            expert_q6_k == nil) {
+            expert_q6_k == nil || expert_weighted_reduce == nil ||
+            argmax_partial == nil || argmax_finalize == nil) {
             throw std::runtime_error(
                 "Metal MoE backend is unavailable: " + device_name);
         }
@@ -716,6 +906,17 @@ struct MoeLLM::Impl {
                     std::size_t requested_capacity,
                     std::size_t requested_expert_cache_count);
     void reset_state();
+    void initialize_expert_sidecar(const std::string& gguf_path) noexcept;
+    const std::uint8_t* read_expert_sidecar(
+        std::size_t layer_index,
+        std::uint32_t expert,
+        std::size_t expected_bytes) noexcept;
+    void write_expert_sidecar(std::size_t layer_index,
+                              std::uint32_t expert,
+                              std::size_t bytes) noexcept;
+    void install_expert_bundle(std::size_t layer_index,
+                               std::uint32_t expert,
+                               std::size_t slot);
     void ensure_experts_cached(std::size_t layer_index,
                                std::uint32_t* route_ids,
                                std::size_t route_count);
@@ -873,6 +1074,296 @@ struct MoeLLM::Impl {
                          const char* phase,
                          bool produce_output);
 };
+
+void MoeLLM::Impl::initialize_expert_sidecar(
+    const std::string& gguf_path) noexcept {
+    expert_sidecar.disable();
+    try {
+        FileIdentity identity;
+        if (!query_file_identity(gguf_path, identity)) {
+            std::cerr << "[moe] expert_bundle_cache=disabled reason=model_stat\n";
+            return;
+        }
+
+        std::error_code error;
+        const std::filesystem::path directory =
+            std::filesystem::path("output") / "expert_cache";
+        std::filesystem::create_directories(directory, error);
+        if (error) {
+            std::cerr << "[moe] expert_bundle_cache=disabled reason="
+                      << error.message() << '\n';
+            return;
+        }
+        expert_sidecar.path = directory /
+            ("qwen35moe_" + model_fingerprint(gguf_path, identity) +
+             ".bundles");
+        expert_sidecar.descriptor = ::open(
+            expert_sidecar.path.c_str(), O_RDWR | O_CREAT, 0644);
+        if (expert_sidecar.descriptor < 0) {
+            std::cerr << "[moe] expert_bundle_cache=disabled reason="
+                      << std::strerror(errno) << '\n';
+            expert_sidecar.disable();
+            return;
+        }
+
+        const std::size_t entry_count = checked_mul(
+            config.layer_count, config.expert_count,
+            "expert bundle index entries");
+        const std::size_t index_bytes = checked_mul(
+            entry_count, sizeof(ExpertBundleEntry),
+            "expert bundle index bytes");
+        ExpertBundleHeader expected;
+        std::memcpy(expected.magic, kExpertBundleMagic.data(),
+                    kExpertBundleMagic.size());
+        expected.version = kExpertBundleVersion;
+        expected.header_bytes = sizeof(ExpertBundleHeader);
+        expected.model_size = identity.size;
+        expected.model_mtime_seconds = identity.mtime_seconds;
+        expected.model_mtime_nanoseconds = identity.mtime_nanoseconds;
+        expected.layer_count = to_uint(config.layer_count,
+                                       "expert bundle layers");
+        expected.expert_count = to_uint(config.expert_count,
+                                        "expert bundle experts");
+        expected.entry_count = entry_count;
+        expected.index_offset = sizeof(ExpertBundleHeader);
+        expected.data_offset = align_up(
+            checked_add(sizeof(ExpertBundleHeader), index_bytes,
+                        "expert bundle data offset"),
+            4096, "expert bundle data alignment");
+
+        struct stat status {};
+        bool valid = ::fstat(expert_sidecar.descriptor, &status) == 0 &&
+            status.st_size >= 0 &&
+            static_cast<std::uint64_t>(status.st_size) >= expected.data_offset;
+        ExpertBundleHeader existing;
+        if (valid) {
+            valid = read_all_at(expert_sidecar.descriptor, &existing,
+                                sizeof(existing), 0) &&
+                std::memcmp(existing.magic, expected.magic,
+                            kExpertBundleMagic.size()) == 0 &&
+                existing.version == expected.version &&
+                existing.header_bytes == expected.header_bytes &&
+                existing.model_size == expected.model_size &&
+                existing.model_mtime_seconds == expected.model_mtime_seconds &&
+                existing.model_mtime_nanoseconds ==
+                    expected.model_mtime_nanoseconds &&
+                existing.layer_count == expected.layer_count &&
+                existing.expert_count == expected.expert_count &&
+                existing.entry_count == expected.entry_count &&
+                existing.index_offset == expected.index_offset &&
+                existing.data_offset == expected.data_offset;
+        }
+
+        expert_sidecar.entries.assign(entry_count, {});
+        if (valid) {
+            valid = read_all_at(
+                expert_sidecar.descriptor, expert_sidecar.entries.data(),
+                index_bytes, existing.index_offset);
+        }
+
+        if (!valid) {
+            if (::ftruncate(expert_sidecar.descriptor, 0) != 0 ||
+                !write_all_at(expert_sidecar.descriptor, &expected,
+                              sizeof(expected), 0) ||
+                !write_all_at(expert_sidecar.descriptor,
+                              expert_sidecar.entries.data(), index_bytes,
+                              expected.index_offset) ||
+                expected.data_offset > static_cast<std::uint64_t>(
+                                           std::numeric_limits<off_t>::max()) ||
+                ::ftruncate(expert_sidecar.descriptor,
+                            static_cast<off_t>(expected.data_offset)) != 0) {
+                std::cerr << "[moe] expert_bundle_cache=disabled reason="
+                          << std::strerror(errno) << '\n';
+                expert_sidecar.disable();
+                return;
+            }
+            expert_sidecar.header = expected;
+            expert_sidecar.append_offset = expected.data_offset;
+        } else {
+            expert_sidecar.header = existing;
+            expert_sidecar.append_offset = static_cast<std::uint64_t>(
+                status.st_size);
+        }
+        if (expert_sidecar.append_offset != 0 &&
+            expert_sidecar.append_offset <=
+                std::numeric_limits<std::size_t>::max()) {
+            expert_sidecar.mapping_size = static_cast<std::size_t>(
+                expert_sidecar.append_offset);
+            void* mapping = ::mmap(
+                nullptr, expert_sidecar.mapping_size, PROT_READ, MAP_SHARED,
+                expert_sidecar.descriptor, 0);
+            if (mapping != MAP_FAILED) {
+                expert_sidecar.mapping =
+                    static_cast<const std::uint8_t*>(mapping);
+            } else {
+                expert_sidecar.mapping_size = 0;
+            }
+        }
+        std::cerr << "[moe] expert_bundle_cache="
+                  << expert_sidecar.path.string()
+                  << " mode=" << (valid ? "reuse" : "create") << '\n';
+    } catch (const std::exception& error) {
+        std::cerr << "[moe] expert_bundle_cache=disabled reason="
+                  << error.what() << '\n';
+        expert_sidecar.disable();
+    } catch (...) {
+        std::cerr << "[moe] expert_bundle_cache=disabled reason=unknown\n";
+        expert_sidecar.disable();
+    }
+}
+
+const std::uint8_t* MoeLLM::Impl::read_expert_sidecar(
+    std::size_t layer_index,
+    std::uint32_t expert,
+    std::size_t expected_bytes) noexcept {
+    if (!expert_sidecar.enabled() || layer_index >= config.layer_count ||
+        expert >= config.expert_count) {
+        return nullptr;
+    }
+    try {
+        const std::size_t index = checked_add(
+            checked_mul(layer_index, config.expert_count,
+                        "expert bundle entry"),
+            expert, "expert bundle entry");
+        if (index >= expert_sidecar.entries.size()) return nullptr;
+        ExpertBundleEntry& entry = expert_sidecar.entries[index];
+        struct stat status {};
+        const bool valid = entry.ready == 1 && entry.size == expected_bytes &&
+            entry.offset >= expert_sidecar.header.data_offset &&
+            entry.offset <= std::numeric_limits<std::uint64_t>::max() -
+                                entry.size &&
+            ::fstat(expert_sidecar.descriptor, &status) == 0 &&
+            status.st_size >= 0 &&
+            entry.offset + entry.size <=
+                static_cast<std::uint64_t>(status.st_size);
+        if (!valid) return nullptr;
+        if (expert_sidecar.mapping != nullptr &&
+            entry.offset + entry.size <= expert_sidecar.mapping_size) {
+            return expert_sidecar.mapping + entry.offset;
+        }
+        expert_sidecar.scratch.resize(expected_bytes);
+        if (!read_all_at(expert_sidecar.descriptor,
+                         expert_sidecar.scratch.data(), expected_bytes,
+                         entry.offset)) {
+            expert_sidecar.disable();
+            return nullptr;
+        }
+        return expert_sidecar.scratch.data();
+    } catch (...) {
+        expert_sidecar.disable();
+        return nullptr;
+    }
+}
+
+void MoeLLM::Impl::write_expert_sidecar(
+    std::size_t layer_index,
+    std::uint32_t expert,
+    std::size_t bytes) noexcept {
+    if (!expert_sidecar.enabled() || bytes == 0 ||
+        bytes > expert_sidecar.scratch.size() ||
+        layer_index >= config.layer_count || expert >= config.expert_count) {
+        return;
+    }
+    try {
+        const std::size_t index = checked_add(
+            checked_mul(layer_index, config.expert_count,
+                        "expert bundle entry"),
+            expert, "expert bundle entry");
+        if (index >= expert_sidecar.entries.size()) return;
+        const std::uint64_t payload_offset = align_up(
+            expert_sidecar.append_offset, 64, "expert bundle payload");
+        if (!write_all_at(expert_sidecar.descriptor,
+                          expert_sidecar.scratch.data(), bytes,
+                          payload_offset)) {
+            expert_sidecar.disable();
+            return;
+        }
+
+        ExpertBundleEntry entry;
+        entry.offset = payload_offset;
+        entry.size = bytes;
+        const std::uint64_t entry_offset = checked_add(
+            expert_sidecar.header.index_offset,
+            checked_mul(index, sizeof(ExpertBundleEntry),
+                        "expert bundle entry offset"),
+            "expert bundle entry offset");
+        if (!write_all_at(expert_sidecar.descriptor, &entry, sizeof(entry),
+                          entry_offset)) {
+            expert_sidecar.disable();
+            return;
+        }
+
+        const std::uint32_t ready = 1;
+        if (!write_all_at(
+                expert_sidecar.descriptor, &ready, sizeof(ready),
+                checked_add(entry_offset, offsetof(ExpertBundleEntry, ready),
+                            "expert bundle ready offset"))) {
+            expert_sidecar.disable();
+            return;
+        }
+        entry.ready = ready;
+        expert_sidecar.entries[index] = entry;
+        expert_sidecar.append_offset = checked_add(
+            payload_offset, bytes, "expert bundle append offset");
+    } catch (...) {
+        expert_sidecar.disable();
+    }
+}
+
+void MoeLLM::Impl::install_expert_bundle(
+    std::size_t layer_index,
+    std::uint32_t expert,
+    std::size_t slot) {
+    if (raw_model == nullptr || layer_index >= layers.size() ||
+        expert >= config.expert_count || slot >= expert_cache_count) {
+        throw std::invalid_argument("invalid expert bundle installation");
+    }
+    Experts& cache = layers[layer_index].experts;
+    const std::size_t gate_offset = 0;
+    const std::size_t up_offset = cache.gate.expert_stride_bytes;
+    const std::size_t down_offset = checked_add(
+        up_offset, cache.up.expert_stride_bytes, "expert bundle down offset");
+    const std::size_t bundle_bytes = checked_add(
+        down_offset, cache.down.expert_stride_bytes, "expert bundle size");
+
+    const std::uint8_t* bundle = read_expert_sidecar(
+        layer_index, expert, bundle_bytes);
+    if (bundle == nullptr) {
+        expert_sidecar.scratch.resize(bundle_bytes);
+        const auto read_weight = [&](const ExpertWeight& weight,
+                                     std::size_t bundle_offset) {
+            const std::size_t source_offset = checked_mul(
+                static_cast<std::size_t>(expert),
+                weight.expert_stride_bytes, "expert source offset");
+            raw_model->read_tensor_slice(
+                weight.source, source_offset,
+                expert_sidecar.scratch.data() + bundle_offset,
+                weight.expert_stride_bytes);
+        };
+        read_weight(cache.gate, gate_offset);
+        read_weight(cache.up, up_offset);
+        read_weight(cache.down, down_offset);
+        bundle = expert_sidecar.scratch.data();
+        write_expert_sidecar(layer_index, expert, bundle_bytes);
+    }
+
+    const auto copy_weight = [&](const ExpertWeight& weight,
+                                 std::size_t bundle_offset) {
+        if (weight.buffer == nil || weight.slots != expert_cache_count) {
+            throw std::runtime_error("invalid expert cache weight");
+        }
+        const std::size_t destination_offset = checked_mul(
+            slot, weight.expert_stride_bytes, "expert cache offset");
+        auto* destination = static_cast<std::uint8_t*>(
+            [weight.buffer contents]) + destination_offset;
+        std::memcpy(destination,
+                    bundle + bundle_offset,
+                    weight.expert_stride_bytes);
+    };
+    copy_weight(cache.gate, gate_offset);
+    copy_weight(cache.up, up_offset);
+    copy_weight(cache.down, down_offset);
+}
 
 void MoeLLM::Impl::load_model(const std::string& gguf_path,
                               std::size_t requested_capacity,
@@ -1033,12 +1524,15 @@ void MoeLLM::Impl::load_model(const std::string& gguf_path,
         layers.push_back(std::move(layer));
     }
     raw_model->validate_all_tensors_loaded();
+    initialize_expert_sidecar(gguf_path);
     reset_state();
 }
 
 void MoeLLM::Impl::reset_state() {
     release_arena();
     turn_peak_arena_bytes = 0;
+    turn_expert_cache_hits = 0;
+    turn_expert_cache_misses = 0;
     sequence_length = 0;
     for (Layer& layer : layers) {
         if (layer.kind != MoeLayerKind::GatedDeltaNet) continue;
@@ -1086,6 +1580,14 @@ void MoeLLM::Impl::ensure_experts_cached(
             "one MoE routing chunk requires more experts than its cache");
     }
 
+    for (std::uint32_t expert : required) {
+        if (cache.expert_to_slot[expert] >= 0) {
+            ++turn_expert_cache_hits;
+        } else {
+            ++turn_expert_cache_misses;
+        }
+    }
+
     // Slots required by this command are pinned while misses are installed, so
     // an early miss cannot evict a later route that was already resident.
     std::vector<bool> pinned(expert_cache_count, false);
@@ -1096,25 +1598,6 @@ void MoeLLM::Impl::ensure_experts_cached(
             cache.last_used[static_cast<std::size_t>(slot)] = ++cache.lru_clock;
         }
     }
-
-    const auto load_weight = [&](const ExpertWeight& weight,
-                                 std::uint32_t expert,
-                                 std::size_t slot) {
-        if (weight.buffer == nil || weight.slots != expert_cache_count ||
-            expert >= config.expert_count) {
-            throw std::runtime_error("invalid expert cache weight");
-        }
-        const std::size_t source_offset = checked_mul(
-            static_cast<std::size_t>(expert), weight.expert_stride_bytes,
-            "expert source offset");
-        const std::size_t destination_offset = checked_mul(
-            slot, weight.expert_stride_bytes, "expert cache offset");
-        auto* destination = static_cast<std::uint8_t*>([weight.buffer contents]) +
-            destination_offset;
-        raw_model->read_tensor_slice(
-            weight.source, source_offset, destination,
-            weight.expert_stride_bytes);
-    };
 
     for (std::uint32_t expert : required) {
         if (cache.expert_to_slot[expert] >= 0) continue;
@@ -1143,9 +1626,7 @@ void MoeLLM::Impl::ensure_experts_cached(
             throw std::runtime_error("no evictable MoE expert cache slot");
         }
 
-        load_weight(cache.gate, expert, slot);
-        load_weight(cache.up, expert, slot);
-        load_weight(cache.down, expert, slot);
+        install_expert_bundle(layer_index, expert, slot);
 
         const std::int32_t evicted = cache.slot_to_expert[slot];
         if (evicted >= 0) {
@@ -1193,6 +1674,14 @@ MoeLLM::Impl::ArenaPlan MoeLLM::Impl::make_arena_plan(
     const std::size_t expert_width = std::max(
         config.expert_feed_forward_size,
         config.shared_expert_feed_forward_size);
+    const std::size_t routed_width = checked_mul(
+        config.expert_used_count, expert_width, "routed expert width");
+    const std::size_t routed_hidden_width = checked_mul(
+        config.expert_used_count, hidden, "routed expert output width");
+    const std::size_t score_width = checked_mul(
+        config.attention_head_count, score_columns, "attention score width");
+    const std::size_t argmax_partials =
+        (config.vocabulary_size - 1) / kArgmaxElementsPerGroup + 1;
 
     ArenaPlan plan;
     const auto add = [&](Slot slot, std::size_t bytes, const char* name) {
@@ -1224,10 +1713,12 @@ MoeLLM::Impl::ArenaPlan MoeLLM::Impl::make_arena_plan(
     add_f32(Slot::SmallA, small_width, "arena small A");
     add_f32(Slot::SmallB, small_width, "arena small B");
     add_f32(Slot::SmallC, small_width, "arena small C");
-    add_f32(Slot::ExpertGate, expert_width, "arena expert gate");
-    add_f32(Slot::ExpertUp, expert_width, "arena expert up");
-    add_f32(Slot::ExpertActivation, expert_width,
+    add_f32(Slot::ExpertGate, routed_width, "arena expert gate");
+    add_f32(Slot::ExpertUp, routed_width, "arena expert up");
+    add_f32(Slot::ExpertActivation, routed_width,
             "arena expert activation");
+    add_f32(Slot::ExpertDown, routed_hidden_width,
+            "arena routed expert output");
     add(Slot::RouteIds,
         checked_mul(checked_mul(rows, config.expert_used_count,
                                 "arena route ids"),
@@ -1235,13 +1726,17 @@ MoeLLM::Impl::ArenaPlan MoeLLM::Impl::make_arena_plan(
         "arena route ids");
     add_f32(Slot::RouteWeights, config.expert_used_count,
             "arena route weights");
-    add(Slot::Scores,
-        float_bytes(checked_mul(rows, score_columns, "arena scores"),
-                    "arena scores"),
-        "arena scores");
+    add_f32(Slot::Scores, score_width, "arena scores");
     add(Slot::Logits,
         float_bytes(config.vocabulary_size, "arena logits"),
         "arena logits");
+    add(Slot::ArgmaxValues,
+        float_bytes(argmax_partials, "arena argmax values"),
+        "arena argmax values");
+    add(Slot::ArgmaxIndices,
+        checked_mul(argmax_partials, sizeof(std::uint32_t),
+                    "arena argmax indices"),
+        "arena argmax indices");
     plan.bytes = align_up(plan.bytes, kArenaAlignment, "MoE arena");
     return plan;
 }
@@ -1870,64 +2365,56 @@ MoeLLM::Impl::Matrix MoeLLM::Impl::encode_full_attention(
 
     const Matrix attention_output = matrix(
         Slot::FeatureD, tokens, query_width, "attention output");
-    const std::size_t heads_per_kv = query_heads / kv_heads;
     const float attention_scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
-    for (std::size_t query_head = 0; query_head < query_heads; ++query_head) {
-        const Matrix scores = matrix(
-            Slot::Scores, tokens, key_length, "attention scores");
-        MetalKVCacheQKParamsHost qk_params;
-        qk_params.query_rows = to_uint(tokens, "QK query rows");
-        qk_params.key_length = to_uint(key_length, "QK key length");
-        qk_params.cache_stride = to_uint(kv_width, "QK cache stride");
-        qk_params.query_stride = to_uint(query_width, "QK query stride");
-        qk_params.head_dim = to_uint(head_dim, "QK head dimension");
-        qk_params.cache_head = to_uint(
-            query_head / heads_per_kv, "QK cache head");
-        qk_params.query_position = to_uint(position, "QK query position");
-        qk_params.scale = attention_scale;
-        const std::size_t query_offset = checked_add(
-            rotated_query.offset,
-            checked_mul(query_head, head_dim, "QK query head offset"),
-            "QK query head offset");
-        [execution.encoder setBuffer:rotated_query.buffer
-                               offset:float_bytes(query_offset,
-                                                  "QK query offset")
-                              atIndex:0];
-        [execution.encoder setBuffer:attention.key_cache offset:0 atIndex:1];
-        [execution.encoder setBuffer:scores.buffer
-                               offset:byte_offset(scores, "QK scores")
-                              atIndex:2];
-        [execution.encoder setBytes:&qk_params length:sizeof(qk_params)
-                            atIndex:3];
-        dispatch_flat(execution, kv_qk, "moe.attention.qk",
-                      checked_mul(tokens, key_length, "QK dispatch"));
+    const Matrix scores = matrix(
+        Slot::Scores, checked_mul(tokens, query_heads, "attention score rows"),
+        key_length, "attention scores");
+    MetalKVCacheQKParamsHost qk_params;
+    qk_params.query_rows = to_uint(tokens, "QK query rows");
+    qk_params.key_length = to_uint(key_length, "QK key length");
+    qk_params.query_heads = to_uint(query_heads, "QK query heads");
+    qk_params.kv_heads = to_uint(kv_heads, "QK KV heads");
+    qk_params.cache_stride = to_uint(kv_width, "QK cache stride");
+    qk_params.query_stride = to_uint(query_width, "QK query stride");
+    qk_params.head_dim = to_uint(head_dim, "QK head dimension");
+    qk_params.query_position = to_uint(position, "QK query position");
+    qk_params.scale = attention_scale;
+    [execution.encoder setBuffer:rotated_query.buffer
+                           offset:byte_offset(rotated_query, "QK query")
+                          atIndex:0];
+    [execution.encoder setBuffer:attention.key_cache offset:0 atIndex:1];
+    [execution.encoder setBuffer:scores.buffer
+                           offset:byte_offset(scores, "QK scores")
+                          atIndex:2];
+    [execution.encoder setBytes:&qk_params length:sizeof(qk_params) atIndex:3];
+    dispatch_flat(
+        execution, kv_qk, "moe.attention.qk",
+        checked_mul(checked_mul(tokens, query_heads, "QK head rows"),
+                    key_length, "QK dispatch"));
 
-        encode_softmax(
-            execution, scores, scores, "moe.attention.softmax");
+    encode_softmax(execution, scores, scores, "moe.attention.softmax");
 
-        MetalKVCacheAVParamsHost av_params;
-        av_params.query_rows = to_uint(tokens, "AV query rows");
-        av_params.key_length = to_uint(key_length, "AV key length");
-        av_params.cache_stride = to_uint(kv_width, "AV cache stride");
-        av_params.score_stride = to_uint(key_length, "AV score stride");
-        av_params.head_dim = to_uint(head_dim, "AV head dimension");
-        av_params.cache_head = to_uint(
-            query_head / heads_per_kv, "AV cache head");
-        av_params.output_stride = to_uint(query_width, "AV output stride");
-        av_params.output_offset = to_uint(
-            query_head * head_dim, "AV output offset");
-        [execution.encoder setBuffer:scores.buffer
-                               offset:byte_offset(scores, "AV scores")
-                              atIndex:0];
-        [execution.encoder setBuffer:attention.value_cache offset:0 atIndex:1];
-        [execution.encoder setBuffer:attention_output.buffer
-                               offset:byte_offset(attention_output, "AV output")
-                              atIndex:2];
-        [execution.encoder setBytes:&av_params length:sizeof(av_params)
-                            atIndex:3];
-        dispatch_flat(execution, kv_av, "moe.attention.av",
-                      checked_mul(tokens, head_dim, "AV dispatch"));
-    }
+    MetalKVCacheAVParamsHost av_params;
+    av_params.query_rows = to_uint(tokens, "AV query rows");
+    av_params.key_length = to_uint(key_length, "AV key length");
+    av_params.query_heads = to_uint(query_heads, "AV query heads");
+    av_params.kv_heads = to_uint(kv_heads, "AV KV heads");
+    av_params.cache_stride = to_uint(kv_width, "AV cache stride");
+    av_params.score_stride = to_uint(key_length, "AV score stride");
+    av_params.head_dim = to_uint(head_dim, "AV head dimension");
+    av_params.output_stride = to_uint(query_width, "AV output stride");
+    [execution.encoder setBuffer:scores.buffer
+                           offset:byte_offset(scores, "AV scores")
+                          atIndex:0];
+    [execution.encoder setBuffer:attention.value_cache offset:0 atIndex:1];
+    [execution.encoder setBuffer:attention_output.buffer
+                           offset:byte_offset(attention_output, "AV output")
+                          atIndex:2];
+    [execution.encoder setBytes:&av_params length:sizeof(av_params) atIndex:3];
+    dispatch_flat(
+        execution, kv_av, "moe.attention.av",
+        checked_mul(checked_mul(tokens, query_heads, "AV head rows"),
+                    head_dim, "AV dispatch"));
 
     const Matrix gate_sigmoid = encode_unary(
         execution, gate,
@@ -2211,6 +2698,8 @@ MoeLLM::Impl::Matrix MoeLLM::Impl::encode_selected_moe(
     const std::size_t expert_ff = config.expert_feed_forward_size;
     const std::size_t shared_ff = config.shared_expert_feed_forward_size;
     const std::size_t hidden = config.embedding_size;
+    const std::size_t routed_rows = checked_mul(
+        tokens, selected, "routed expert rows");
     const Region& route_id_region =
         arena_plan.regions[slot_index(Slot::RouteIds)];
     const Matrix route_weights = matrix(
@@ -2218,11 +2707,14 @@ MoeLLM::Impl::Matrix MoeLLM::Impl::encode_selected_moe(
 
     const auto expert_product = [&](const Matrix& input,
                                     const ExpertWeight& weight,
-                                    std::size_t route,
+                                    bool activation_is_routed,
                                     const Matrix& destination,
                                     const char* operation) {
-        if (input.rows != tokens || input.cols != weight.cols ||
-            destination.rows != tokens || destination.cols != weight.rows ||
+        const std::size_t expected_input_rows = activation_is_routed
+            ? routed_rows : tokens;
+        if (input.rows != expected_input_rows || input.cols != weight.cols ||
+            destination.rows != routed_rows ||
+            destination.cols != weight.rows ||
             input.stride != input.cols || destination.stride != destination.cols ||
             weight.slots != expert_cache_count) {
             throw std::invalid_argument(
@@ -2239,7 +2731,8 @@ MoeLLM::Impl::Matrix MoeLLM::Impl::encode_selected_moe(
                 metal_ggml_type_name(weight.type));
         }
         MetalExpertProductParamsHost params;
-        params.rows = to_uint(tokens, "expert rows");
+        params.tokens = to_uint(tokens, "expert tokens");
+        params.routes = to_uint(selected, "expert routes");
         params.output_size = to_uint(weight.rows, "expert output size");
         params.input_size = to_uint(weight.cols, "expert input size");
         params.activation_stride = to_uint(input.stride,
@@ -2248,8 +2741,7 @@ MoeLLM::Impl::Matrix MoeLLM::Impl::encode_selected_moe(
                                           "expert weight row bytes");
         params.expert_stride_bytes = to_uint(weight.expert_stride_bytes,
                                              "expert weight stride");
-        params.route_stride = to_uint(selected, "expert route stride");
-        params.route_index = to_uint(route, "expert route index");
+        params.activation_is_routed = activation_is_routed ? 1u : 0u;
         [execution.encoder setBuffer:input.buffer
                                offset:byte_offset(input, operation)
                               atIndex:0];
@@ -2261,62 +2753,56 @@ MoeLLM::Impl::Matrix MoeLLM::Impl::encode_selected_moe(
                                offset:byte_offset(destination, operation)
                               atIndex:3];
         [execution.encoder setBytes:&params length:sizeof(params) atIndex:4];
-        dispatch_tiles(execution, pipeline, operation, tokens, weight.rows);
+        dispatch_flat(
+            execution, pipeline, operation,
+            checked_mul(routed_rows, weight.rows, "expert dispatch"));
         return destination;
     };
 
-    Matrix accumulator;
-    bool accumulator_is_a = false;
-    for (std::size_t route = 0; route < selected; ++route) {
-        const Matrix gate = expert_product(
-            normalized, experts.gate, route,
-            matrix(Slot::ExpertGate, tokens, expert_ff,
-                   "routed expert gate"),
-            "moe.ffn.expert_gate");
-        const Matrix up = expert_product(
-            normalized, experts.up, route,
-            matrix(Slot::ExpertUp, tokens, expert_ff,
-                   "routed expert up"),
-            "moe.ffn.expert_up");
-        const Matrix activation = encode_binary(
-            execution, gate, up,
-            matrix(Slot::ExpertActivation, tokens, expert_ff,
-                   "routed expert activation"),
-            swiglu, "moe.ffn.expert_swiglu");
+    const Matrix gate = expert_product(
+        normalized, experts.gate, false,
+        matrix(Slot::ExpertGate, routed_rows, expert_ff,
+               "routed expert gate"),
+        "moe.ffn.expert_gate");
+    const Matrix up = expert_product(
+        normalized, experts.up, false,
+        matrix(Slot::ExpertUp, routed_rows, expert_ff,
+               "routed expert up"),
+        "moe.ffn.expert_up");
+    const Matrix activation = encode_binary(
+        execution, gate, up,
+        matrix(Slot::ExpertActivation, routed_rows, expert_ff,
+               "routed expert activation"),
+        swiglu, "moe.ffn.expert_swiglu");
+    const Matrix down = expert_product(
+        activation, experts.down, true,
+        matrix(Slot::ExpertDown, routed_rows, hidden,
+               "routed expert down"),
+        "moe.ffn.expert_down");
 
-        if (route == 0) {
-            const Matrix down = expert_product(
-                activation, experts.down, route,
-                matrix(Slot::HiddenA, tokens, hidden,
-                       "routed expert down"),
-                "moe.ffn.expert_down");
-            accumulator = encode_row_scale(
-                execution, down, route_weights, route,
-                matrix(Slot::HiddenB, tokens, hidden,
-                       "routed expert accumulator"),
-                "moe.ffn.expert_weight");
-            accumulator_is_a = false;
-            continue;
-        }
-
-        const Slot free_hidden = accumulator_is_a
-            ? Slot::HiddenB : Slot::HiddenA;
-        const Matrix down = expert_product(
-            activation, experts.down, route,
-            matrix(free_hidden, tokens, hidden, "routed expert down"),
-            "moe.ffn.expert_down");
-        const Matrix scaled = encode_row_scale(
-            execution, down, route_weights, route,
-            matrix(Slot::HiddenScratch, tokens, hidden,
-                   "weighted routed expert"),
-            "moe.ffn.expert_weight");
-        accumulator = encode_binary(
-            execution, accumulator, scaled,
-            matrix(free_hidden, tokens, hidden,
-                   "routed expert reduction"),
-            residual, "moe.ffn.expert_reduce");
-        accumulator_is_a = !accumulator_is_a;
-    }
+    const Matrix accumulator = matrix(
+        Slot::HiddenB, tokens, hidden, "routed expert accumulator");
+    MetalExpertWeightedReduceParamsHost reduce_params{
+        to_uint(tokens, "expert reduction tokens"),
+        to_uint(selected, "expert reduction routes"),
+        to_uint(hidden, "expert reduction columns")};
+    [execution.encoder setBuffer:down.buffer
+                           offset:byte_offset(down, "expert reduction input")
+                          atIndex:0];
+    [execution.encoder setBuffer:route_weights.buffer
+                           offset:byte_offset(route_weights,
+                                              "expert reduction weights")
+                          atIndex:1];
+    [execution.encoder setBuffer:accumulator.buffer
+                           offset:byte_offset(accumulator,
+                                              "expert reduction output")
+                          atIndex:2];
+    [execution.encoder setBytes:&reduce_params
+                         length:sizeof(reduce_params)
+                        atIndex:3];
+    dispatch_flat(
+        execution, expert_weighted_reduce, "moe.ffn.expert_weighted_reduce",
+        checked_mul(tokens, hidden, "expert reduction dispatch"));
 
     const Matrix shared_gate_raw = encode_product(
         execution, normalized, experts.shared_router,
@@ -2341,11 +2827,9 @@ MoeLLM::Impl::Matrix MoeLLM::Impl::encode_selected_moe(
         matrix(Slot::ExpertActivation, tokens, shared_ff,
                "shared expert activation"),
         swiglu, "moe.ffn.shared_swiglu");
-    const Slot free_hidden = accumulator_is_a
-        ? Slot::HiddenB : Slot::HiddenA;
     const Matrix shared_down = encode_product(
         execution, shared_activation, experts.shared_down,
-        matrix(free_hidden, tokens, hidden, "shared expert down"),
+        matrix(Slot::HiddenA, tokens, hidden, "shared expert down"),
         "moe.ffn.shared_down");
     const Matrix scaled_shared = encode_row_scale(
         execution, shared_down, shared_gate, 0,
@@ -2354,7 +2838,7 @@ MoeLLM::Impl::Matrix MoeLLM::Impl::encode_selected_moe(
         "moe.ffn.shared_weight");
     return encode_binary(
         execution, accumulator, scaled_shared,
-        matrix(free_hidden, tokens, hidden, "combined MoE output"),
+        matrix(Slot::HiddenA, tokens, hidden, "combined MoE output"),
         residual, "moe.ffn.combine_shared");
 }
 
@@ -2408,33 +2892,32 @@ std::int32_t MoeLLM::Impl::forward(
     const std::size_t tokens = token_ids.size();
     const std::size_t sequence_tokens = checked_add(
         position, tokens, "forward sequence length");
+    if (layers.empty()) {
+        throw std::runtime_error("MoE model has no decoder layers");
+    }
 
-    const std::string embedding_phase = std::string(phase) + ".embedding";
-    Execution embedding_execution = begin_execution(
-        embedding_phase.c_str(), sequence_tokens);
+    // The first command embeds the input and continues through layer zero's
+    // router. Every later command consumes the route selected by the previous
+    // command, evaluates those experts, and continues through the next layer's
+    // router. This leaves only the unavoidable route readback boundary.
+    const std::string first_phase = std::string(phase) + ".embedding_route.0";
+    Execution first_execution = begin_execution(
+        first_phase.c_str(), sequence_tokens);
     const id<MTLBuffer> token_buffer = io_buffer(
-        embedding_execution, token_ids.data(),
+        first_execution, token_ids.data(),
         checked_mul(tokens, sizeof(std::int32_t), "token id buffer"),
         "token id buffer");
     Matrix hidden = encode_embedding(
-        embedding_execution, token_buffer, tokens,
+        first_execution, token_buffer, tokens,
         matrix(Slot::HiddenA, tokens, config.embedding_size,
                "embedded tokens"));
-    finish_execution(
-        embedding_execution, embedding_phase.c_str());
+    Matrix attention_residual = encode_layer_route(
+        first_execution, hidden, layers.front(), position);
+    finish_execution(first_execution, first_phase.c_str());
 
     for (std::size_t layer_index = 0;
          layer_index < layers.size();
          ++layer_index) {
-        const std::string layer_prefix = std::string(phase) + ".layer." +
-            std::to_string(layer_index);
-        const std::string route_phase = layer_prefix + ".route";
-        Execution route_execution = begin_execution(
-            route_phase.c_str(), sequence_tokens);
-        const Matrix attention_residual = encode_layer_route(
-            route_execution, hidden, layers[layer_index], position);
-        finish_execution(route_execution, route_phase.c_str());
-
         const Region& route_region =
             arena_plan.regions[slot_index(Slot::RouteIds)];
         auto* route_ids = reinterpret_cast<std::uint32_t*>(
@@ -2445,56 +2928,114 @@ std::int32_t MoeLLM::Impl::forward(
             checked_mul(tokens, config.expert_used_count,
                         "routed expert count"));
 
-        const std::string expert_phase = layer_prefix + ".experts";
-        Execution expert_execution = begin_execution(
-            expert_phase.c_str(), sequence_tokens);
+        const bool last_layer = layer_index + 1 == layers.size();
+        const std::string command_phase = std::string(phase) + ".layer." +
+            std::to_string(layer_index) +
+            (last_layer
+                 ? (produce_output ? ".experts_output" : ".experts")
+                 : ".experts_route." + std::to_string(layer_index + 1));
+        Execution execution = begin_execution(
+            command_phase.c_str(), sequence_tokens);
         hidden = encode_layer_experts(
-            expert_execution, attention_residual, layers[layer_index]);
-        finish_execution(expert_execution, expert_phase.c_str());
+            execution, attention_residual, layers[layer_index]);
+
+        if (!last_layer) {
+            attention_residual = encode_layer_route(
+                execution, hidden, layers[layer_index + 1], position);
+            finish_execution(execution, command_phase.c_str());
+            continue;
+        }
+
+        if (!produce_output) {
+            finish_execution(execution, command_phase.c_str());
+            return -1;
+        }
+
+        const Matrix final_norm = encode_rmsnorm(
+            execution, hidden, output_norm,
+            matrix(Slot::Norm, tokens, config.embedding_size, "final norm"),
+            "moe.output_norm");
+        const Matrix last_hidden = view(
+            final_norm,
+            checked_mul(tokens - 1, final_norm.stride, "last hidden offset"),
+            1, final_norm.cols, final_norm.stride, "last hidden row");
+        const Matrix logits = encode_product(
+            execution, last_hidden, output,
+            matrix(Slot::Logits, 1, config.vocabulary_size, "output logits"),
+            "moe.output_projection");
+
+        const std::size_t partial_count =
+            (config.vocabulary_size - 1) / kArgmaxElementsPerGroup + 1;
+        const Region& partial_value_region =
+            arena_plan.regions[slot_index(Slot::ArgmaxValues)];
+        const Region& partial_index_region =
+            arena_plan.regions[slot_index(Slot::ArgmaxIndices)];
+        MetalArgmaxParamsHost partial_params{
+            to_uint(config.vocabulary_size, "argmax vocabulary"),
+            kArgmaxElementsPerGroup};
+        [execution.encoder setBuffer:logits.buffer
+                               offset:byte_offset(logits, "argmax logits")
+                              atIndex:0];
+        [execution.encoder setBuffer:arena
+                               offset:partial_value_region.offset_bytes
+                              atIndex:1];
+        [execution.encoder setBuffer:arena
+                               offset:partial_index_region.offset_bytes
+                              atIndex:2];
+        [execution.encoder setBytes:&partial_params
+                             length:sizeof(partial_params)
+                            atIndex:3];
+        if ([argmax_partial maxTotalThreadsPerThreadgroup] <
+            kReductionThreads) {
+            throw std::runtime_error(
+                "parallel argmax requires 256 threads per group");
+        }
+        set_pipeline(execution, argmax_partial, "moe.argmax.partial",
+                     partial_count, 1, kReductionThreads, 1);
+        [execution.encoder
+            dispatchThreadgroups:MTLSizeMake(partial_count, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(kReductionThreads, 1, 1)];
+        [execution.encoder popDebugGroup];
+
+        MetalArgmaxParamsHost finalize_params{
+            to_uint(partial_count, "argmax partial count"), 0};
+        [execution.encoder setBuffer:arena
+                               offset:partial_value_region.offset_bytes
+                              atIndex:0];
+        [execution.encoder setBuffer:arena
+                               offset:partial_index_region.offset_bytes
+                              atIndex:1];
+        [execution.encoder setBuffer:arena
+                               offset:partial_index_region.offset_bytes
+                              atIndex:2];
+        [execution.encoder setBytes:&finalize_params
+                             length:sizeof(finalize_params)
+                            atIndex:3];
+        if ([argmax_finalize maxTotalThreadsPerThreadgroup] <
+            kReductionThreads) {
+            throw std::runtime_error(
+                "parallel argmax finalize requires 256 threads per group");
+        }
+        set_pipeline(execution, argmax_finalize, "moe.argmax.finalize",
+                     1, 1, kReductionThreads, 1);
+        [execution.encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                          threadsPerThreadgroup:MTLSizeMake(
+                              kReductionThreads, 1, 1)];
+        [execution.encoder popDebugGroup];
+
+        finish_execution(execution, command_phase.c_str());
+        const auto* result_address = reinterpret_cast<const std::uint32_t*>(
+            static_cast<const std::uint8_t*>([arena contents]) +
+            partial_index_region.offset_bytes);
+        const std::uint32_t result = *result_address;
+        if (result > static_cast<std::uint32_t>(
+                         std::numeric_limits<std::int32_t>::max())) {
+            throw std::overflow_error("generated token does not fit int32_t");
+        }
+        return static_cast<std::int32_t>(result);
     }
 
-    if (!produce_output) return -1;
-
-    const std::string output_phase = std::string(phase) + ".output";
-    Execution output_execution = begin_execution(
-        output_phase.c_str(), sequence_tokens);
-    const Matrix final_norm = encode_rmsnorm(
-        output_execution, hidden, output_norm,
-        matrix(Slot::Norm, tokens, config.embedding_size, "final norm"),
-        "moe.output_norm");
-    const Matrix last_hidden = view(
-        final_norm,
-        checked_mul(tokens - 1, final_norm.stride, "last hidden offset"),
-        1, final_norm.cols, final_norm.stride, "last hidden row");
-    const Matrix logits = encode_product(
-        output_execution, last_hidden, output,
-        matrix(Slot::Logits, 1, config.vocabulary_size, "output logits"),
-        "moe.output_projection");
-
-    id<MTLBuffer> token_output = io_buffer(
-        output_execution, nullptr, sizeof(std::uint32_t), "argmax output");
-    MetalArgmaxParamsHost argmax_params{
-        to_uint(config.vocabulary_size, "argmax vocabulary")};
-    [output_execution.encoder setBuffer:logits.buffer
-                                  offset:byte_offset(logits, "argmax logits")
-                                 atIndex:0];
-    [output_execution.encoder setBuffer:token_output offset:0 atIndex:1];
-    [output_execution.encoder setBytes:&argmax_params
-                                length:sizeof(argmax_params)
-                               atIndex:2];
-    set_pipeline(output_execution, argmax, "moe.argmax", 1, 1, 1, 1);
-    [output_execution.encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1)
-                             threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
-    [output_execution.encoder popDebugGroup];
-
-    finish_execution(output_execution, output_phase.c_str());
-    const std::uint32_t result =
-        *static_cast<const std::uint32_t*>([token_output contents]);
-    if (result > static_cast<std::uint32_t>(
-                     std::numeric_limits<std::int32_t>::max())) {
-        throw std::overflow_error("generated token does not fit int32_t");
-    }
-    return static_cast<std::int32_t>(result);
+    throw std::logic_error("MoE forward did not execute a final layer");
 }
 
 MoeLLM::MoeLLM(const std::string& gguf_path,
@@ -2635,10 +3176,20 @@ std::size_t MoeLLM::expert_cache_count() const noexcept {
     return impl_ == nullptr ? 0 : impl_->expert_cache_count;
 }
 
+ExpertCacheStats MoeLLM::expert_cache_stats() const noexcept {
+    if (impl_ == nullptr) return {};
+    return {
+        impl_->turn_expert_cache_hits,
+        impl_->turn_expert_cache_misses,
+    };
+}
+
 bool MoeLLM::available() const noexcept {
     return impl_ != nullptr && impl_->device != nil && impl_->queue != nil &&
            impl_->gdn != nil && impl_->expert_q4_k != nil &&
-           impl_->expert_q6_k != nil;
+           impl_->expert_q6_k != nil &&
+           impl_->expert_weighted_reduce != nil &&
+           impl_->argmax_partial != nil && impl_->argmax_finalize != nil;
 }
 
 bool MoeLLM::uses_gpu() const noexcept {

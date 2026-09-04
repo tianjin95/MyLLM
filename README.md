@@ -194,20 +194,35 @@ models. Ordinary Q5_0, Q8_0, Q4_K, Q5_K, and Q6_K weights remain in persistent
 Metal buffers. Routed gate/up/down tensors instead remain file-backed: the GGUF
 is mapped read-only and every layer owns an explicit LRU cache of `N` expert
 bundles in shared Metal buffers. A route command returns top-k IDs, CPU fills
-missing slots directly from the mapped expert slices and rewrites IDs to slot
-indices, and an expert command resumes the GPU graph. Cached experts survive
-`reset()` and can be reused by later turns.
+missing slots and rewrites IDs to slot indices, and an expert command resumes
+the GPU graph. Cached experts survive `reset()` and can be reused by later
+turns.
+
+The first load of a `(layer, expert)` gathers its three disjoint GGUF slices and
+appends one contiguous gate/up/down bundle under
+`output/expert_cache/qwen35moe_<model-fingerprint>.bundles`. Later evictions and
+processes load that bundle with one contiguous file access; an existing sidecar
+is mapped read-only to avoid an extra staging copy. The fixed index is validated
+against model size and modification time, and its `ready` flag is written only
+after the payload. Creation or validation failures fall back to the original
+GGUF slices. The payload is lazy, so startup never creates the complete expert
+copy, although the file can eventually grow if every expert is routed.
 
 Ten full-attention layers own FP32 K/V caches. The other 30 layers own
 persistent FP32 Gated DeltaNet matrices and causal Conv1D history. `reset()`
 clears sequence state and releases the previous turn's decode arena. It does not
 discard expert LRU contents.
 
-MoE forward uses one command for embedding, two commands per decoder layer
-(attention/router, then experts), and one command for the final norm/LM head.
-Hidden activations remain in one shared Arena; only route IDs cross the CPU/GPU
-boundary. For correctness with finite caches, prefill automatically uses at
-most `floor(expert_cache / top_k)` tokens per chunk. Position, full-attention KV
+MoE forward uses one command for embedding plus layer-zero routing, then each
+command evaluates the previous layer's experts and continues through the next
+layer's attention/router. The last command also runs final norm, LM head, and a
+two-stage parallel argmax. This is 41 commands for the 40-layer model. Hidden
+activations remain in one shared Arena; only route IDs cross the CPU/GPU
+boundary. All selected experts are carried as a `[token, top_k, channel]` batch,
+and all full-attention heads are carried as a `[token, head, position]` batch;
+gate/up/down and QK/Softmax/AV remain separate kernels. For correctness with
+finite caches, prefill automatically uses at most
+`floor(expert_cache / top_k)` tokens per chunk. Position, full-attention KV
 cache, and DeltaNet recurrent state remain continuous across chunks. Only the
 last chunk runs the LM head. The implementation uses partial text iMRoPE,
 top-8 routed experts, one shared expert, and a correctness-first serial-token
@@ -234,6 +249,13 @@ even when the prefill Arena has already been released, and
 current FP32 cache payload and the intermediate value is a shape-based estimate
 (`intermediate_kind=estimated`), because the reference CPU path does not use a
 single Arena allocator.
+
+For `MoeLLM`, the same line also prints `expert_cache_requests`,
+`expert_cache_hits`, `expert_cache_misses`, and `expert_cache_hit_rate`. One
+request means one unique `(layer, routing chunk, expert)` lookup; repeated use
+of the same expert by multiple tokens in one chunk does not cause another file
+load and is counted once. Counters reset at the beginning of every turn, while
+the LRU contents remain available across turns.
 
 ## Inference path
 

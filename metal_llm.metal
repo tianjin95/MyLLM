@@ -76,10 +76,11 @@ struct MetalKVCacheWriteParams {
 struct MetalKVCacheQKParams {
     uint query_rows;
     uint key_length;
+    uint query_heads;
+    uint kv_heads;
     uint cache_stride;
     uint query_stride;
     uint head_dim;
-    uint cache_head;
     uint query_position;
     float scale;
 };
@@ -87,16 +88,17 @@ struct MetalKVCacheQKParams {
 struct MetalKVCacheAVParams {
     uint query_rows;
     uint key_length;
+    uint query_heads;
+    uint kv_heads;
     uint cache_stride;
     uint score_stride;
     uint head_dim;
-    uint cache_head;
     uint output_stride;
-    uint output_offset;
 };
 
 struct MetalArgmaxParams {
     uint length;
+    uint elements_per_group;
 };
 
 struct MetalSplitQGateParams {
@@ -149,14 +151,20 @@ struct MetalTopKParams {
 };
 
 struct MetalExpertProductParams {
-    uint rows;
+    uint tokens;
+    uint routes;
     uint output_size;
     uint input_size;
     uint activation_stride;
     uint weight_row_bytes;
     uint expert_stride_bytes;
-    uint route_stride;
-    uint route_index;
+    uint activation_is_routed;
+};
+
+struct MetalExpertWeightedReduceParams {
+    uint tokens;
+    uint routes;
+    uint cols;
 };
 
 #define MYLLM_TILE_M 16
@@ -981,26 +989,31 @@ kernel void metal_kv_cache_write_f32(
     value_cache[destination] = value_source[index];
 }
 
-// Compute scaled QK scores directly against one KV head in the fixed cache.
-// Output is [query_rows, key_length]. One thread owns one score element.
-// `query_position` is the absolute position of query row zero, allowing the
-// same kernel to serve both a contiguous prefill and one-token decode.
+// Compute all query heads directly against the fixed KV cache. The flattened
+// output is [query_rows * query_heads, key_length], with GQA mapping each query
+// head to query_head / (query_heads / kv_heads). One thread owns one score.
 kernel void metal_kv_cache_qk_f32(
         device const float * query [[buffer(0)]],
         device const float * key_cache [[buffer(1)]],
         device float * output [[buffer(2)]],
         constant MetalKVCacheQKParams & params [[buffer(3)]],
         uint index [[thread_position_in_grid]]) {
-    const uint total = params.query_rows * params.key_length;
+    const uint total =
+        params.query_rows * params.query_heads * params.key_length;
     if (index >= total) {
         return;
     }
 
-    const uint query_row = index / params.key_length;
-    const uint key_row = index - query_row * params.key_length;
-    const uint query_offset = query_row * params.query_stride;
+    const uint score_row = index / params.key_length;
+    const uint key_row = index - score_row * params.key_length;
+    const uint query_head = score_row % params.query_heads;
+    const uint query_row = score_row / params.query_heads;
+    const uint heads_per_kv = params.query_heads / params.kv_heads;
+    const uint cache_head = query_head / heads_per_kv;
+    const uint query_offset = query_row * params.query_stride +
+                              query_head * params.head_dim;
     const uint key_offset = key_row * params.cache_stride +
-                            params.cache_head * params.head_dim;
+                            cache_head * params.head_dim;
 
     float accumulator = 0.0f;
     for (uint dim = 0; dim < params.head_dim; ++dim) {
@@ -1013,32 +1026,37 @@ kernel void metal_kv_cache_qk_f32(
         : accumulator * params.scale;
 }
 
-// Compute attention-value products directly against one KV value head in the
-// fixed cache. Scores are supplied after softmax and have shape
-// [query_rows, key_length]; output has shape [query_rows, head_dim].
+// Compute all query heads against the fixed KV value cache. Scores are the
+// flattened [query_rows * query_heads, key_length] matrix produced above;
+// output is packed as [query_rows, query_heads * head_dim].
 kernel void metal_kv_cache_av_f32(
         device const float * scores [[buffer(0)]],
         device const float * value_cache [[buffer(1)]],
         device float * output [[buffer(2)]],
         constant MetalKVCacheAVParams & params [[buffer(3)]],
         uint index [[thread_position_in_grid]]) {
-    const uint total = params.query_rows * params.head_dim;
+    const uint total =
+        params.query_rows * params.query_heads * params.head_dim;
     if (index >= total) {
         return;
     }
 
-    const uint query_row = index / params.head_dim;
-    const uint dim = index - query_row * params.head_dim;
+    const uint output_head_row = index / params.head_dim;
+    const uint dim = index - output_head_row * params.head_dim;
+    const uint query_head = output_head_row % params.query_heads;
+    const uint query_row = output_head_row / params.query_heads;
+    const uint heads_per_kv = params.query_heads / params.kv_heads;
+    const uint cache_head = query_head / heads_per_kv;
     float accumulator = 0.0f;
     for (uint key_row = 0; key_row < params.key_length; ++key_row) {
         const float probability =
-            scores[query_row * params.score_stride + key_row];
+            scores[output_head_row * params.score_stride + key_row];
         const uint value_offset = key_row * params.cache_stride +
-                                   params.cache_head * params.head_dim + dim;
+                                   cache_head * params.head_dim + dim;
         accumulator += probability * value_cache[value_offset];
     }
     const uint output_index = query_row * params.output_stride +
-                              params.output_offset + dim;
+                              query_head * params.head_dim + dim;
     output[output_index] = accumulator;
 }
 
@@ -1461,16 +1479,21 @@ kernel void metal_expert_gemm_q4_k_f32(
         device const uint * expert_ids [[buffer(2)]],
         device float * output [[buffer(3)]],
         constant MetalExpertProductParams & params [[buffer(4)]],
-        uint2 position [[thread_position_in_grid]]) {
-    const uint col = position.x;
-    const uint row = position.y;
-    if (row >= params.rows || col >= params.output_size) return;
-    const uint expert = expert_ids[
-        row * params.route_stride + params.route_index];
+        uint index [[thread_position_in_grid]]) {
+    const uint routed_rows = params.tokens * params.routes;
+    const uint total = routed_rows * params.output_size;
+    if (index >= total) return;
+    const uint routed_row = index / params.output_size;
+    const uint col = index - routed_row * params.output_size;
+    const uint token = routed_row / params.routes;
+    const uint expert = expert_ids[routed_row];
+    const uint activation_row = params.activation_is_routed != 0
+        ? routed_row : token;
     device const uchar * weight_row = weights +
         expert * params.expert_stride_bytes + col * params.weight_row_bytes;
-    output[row * params.output_size + col] = dot_q4_k_f32_packed_reuse(
-        weight_row, activation + row * params.activation_stride,
+    output[routed_row * params.output_size + col] =
+        dot_q4_k_f32_packed_reuse(
+        weight_row, activation + activation_row * params.activation_stride,
         params.input_size);
 }
 
@@ -1480,45 +1503,142 @@ kernel void metal_expert_gemm_q6_k_f32(
         device const uint * expert_ids [[buffer(2)]],
         device float * output [[buffer(3)]],
         constant MetalExpertProductParams & params [[buffer(4)]],
-        uint2 position [[thread_position_in_grid]]) {
-    const uint col = position.x;
-    const uint row = position.y;
-    if (row >= params.rows || col >= params.output_size) return;
-    const uint expert = expert_ids[
-        row * params.route_stride + params.route_index];
+        uint index [[thread_position_in_grid]]) {
+    const uint routed_rows = params.tokens * params.routes;
+    const uint total = routed_rows * params.output_size;
+    if (index >= total) return;
+    const uint routed_row = index / params.output_size;
+    const uint col = index - routed_row * params.output_size;
+    const uint token = routed_row / params.routes;
+    const uint expert = expert_ids[routed_row];
+    const uint activation_row = params.activation_is_routed != 0
+        ? routed_row : token;
     device const uchar * weight_row = weights +
         expert * params.expert_stride_bytes + col * params.weight_row_bytes;
-    output[row * params.output_size + col] = dot_q6_k_f32(
-        weight_row, activation + row * params.activation_stride,
+    output[routed_row * params.output_size + col] = dot_q6_k_f32(
+        weight_row, activation + activation_row * params.activation_stride,
         params.input_size);
 }
 
-// Greedy selection is kept on the device so a generation step returns only a
-// four-byte token id instead of the complete vocabulary logits. This baseline
-// implementation intentionally launches one thread, which scans the whole
-// vocabulary serially; a production implementation would use a parallel
-// multi-stage reduction.
-kernel void metal_argmax_f32(
+// Reduce the routed expert outputs with their router probabilities. Keeping
+// this as a separate kernel preserves the gate/up/down operator boundaries.
+kernel void metal_expert_weighted_reduce_f32(
         device const float * input [[buffer(0)]],
-        device uint * output [[buffer(1)]],
-        constant MetalArgmaxParams & params [[buffer(2)]],
+        device const float * weights [[buffer(1)]],
+        device float * output [[buffer(2)]],
+        constant MetalExpertWeightedReduceParams & params [[buffer(3)]],
         uint index [[thread_position_in_grid]]) {
-    if (index != 0) {
-        return;
+    const uint total = params.tokens * params.cols;
+    if (index >= total) return;
+    const uint token = index / params.cols;
+    const uint col = index - token * params.cols;
+    float accumulator = 0.0f;
+    for (uint route = 0; route < params.routes; ++route) {
+        const uint routed_row = token * params.routes + route;
+        accumulator += weights[routed_row] *
+                       input[routed_row * params.cols + col];
     }
-    if (params.length == 0) {
-        output[0] = 0;
-        return;
-    }
+    output[index] = accumulator;
+}
 
-    uint best_index = 0;
-    float best_value = input[0];
-    for (uint candidate = 1; candidate < params.length; ++candidate) {
+inline bool argmax_better(float candidate_value,
+                          uint candidate_index,
+                          float best_value,
+                          uint best_index) {
+    return candidate_value > best_value ||
+           (candidate_value == best_value && candidate_index < best_index);
+}
+
+// Stage one assigns a contiguous logit range to each threadgroup. Threads scan
+// it with a coalesced stride and reduce to one (value, index) pair per group.
+kernel void metal_argmax_partial_f32(
+        device const float * input [[buffer(0)]],
+        device float * partial_values [[buffer(1)]],
+        device uint * partial_indices [[buffer(2)]],
+        constant MetalArgmaxParams & params [[buffer(3)]],
+        uint local_index [[thread_index_in_threadgroup]],
+        uint group_index [[threadgroup_position_in_grid]],
+        uint threads_per_group [[threads_per_threadgroup]]) {
+    threadgroup float shared_values[MYLLM_ELEMENTWISE_THREADS];
+    threadgroup uint shared_indices[MYLLM_ELEMENTWISE_THREADS];
+
+    const uint begin = group_index * params.elements_per_group;
+    const uint end = min(begin + params.elements_per_group, params.length);
+    float best_value = -INFINITY;
+    uint best_index = 0xffffffffu;
+    for (uint candidate = begin + local_index;
+         candidate < end;
+         candidate += threads_per_group) {
         const float value = input[candidate];
-        if (value > best_value) {
+        if (argmax_better(value, candidate, best_value, best_index)) {
             best_value = value;
             best_index = candidate;
         }
     }
-    output[0] = best_index;
+    shared_values[local_index] = best_value;
+    shared_indices[local_index] = best_index;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint offset = threads_per_group / 2; offset != 0; offset /= 2) {
+        if (local_index < offset) {
+            const float candidate_value = shared_values[local_index + offset];
+            const uint candidate_index = shared_indices[local_index + offset];
+            if (argmax_better(candidate_value, candidate_index,
+                              shared_values[local_index],
+                              shared_indices[local_index])) {
+                shared_values[local_index] = candidate_value;
+                shared_indices[local_index] = candidate_index;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (local_index == 0) {
+        partial_values[group_index] = shared_values[0];
+        partial_indices[group_index] = shared_indices[0];
+    }
+}
+
+// Stage two handles an arbitrary number of partials with one threadgroup and
+// writes only the winning token id back to shared memory.
+kernel void metal_argmax_finalize_f32(
+        device const float * partial_values [[buffer(0)]],
+        device const uint * partial_indices [[buffer(1)]],
+        device uint * output [[buffer(2)]],
+        constant MetalArgmaxParams & params [[buffer(3)]],
+        uint local_index [[thread_index_in_threadgroup]],
+        uint threads_per_group [[threads_per_threadgroup]]) {
+    threadgroup float shared_values[MYLLM_ELEMENTWISE_THREADS];
+    threadgroup uint shared_indices[MYLLM_ELEMENTWISE_THREADS];
+
+    float best_value = -INFINITY;
+    uint best_index = 0xffffffffu;
+    for (uint candidate = local_index;
+         candidate < params.length;
+         candidate += threads_per_group) {
+        const float value = partial_values[candidate];
+        const uint index = partial_indices[candidate];
+        if (argmax_better(value, index, best_value, best_index)) {
+            best_value = value;
+            best_index = index;
+        }
+    }
+    shared_values[local_index] = best_value;
+    shared_indices[local_index] = best_index;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint offset = threads_per_group / 2; offset != 0; offset /= 2) {
+        if (local_index < offset) {
+            const float candidate_value = shared_values[local_index + offset];
+            const uint candidate_index = shared_indices[local_index + offset];
+            if (argmax_better(candidate_value, candidate_index,
+                              shared_values[local_index],
+                              shared_indices[local_index])) {
+                shared_values[local_index] = candidate_value;
+                shared_indices[local_index] = candidate_index;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (local_index == 0) output[0] = shared_indices[0];
 }

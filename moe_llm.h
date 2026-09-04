@@ -11,6 +11,15 @@
 
 namespace llm {
 
+struct ExpertCacheStats {
+    std::uint64_t hits = 0;
+    std::uint64_t misses = 0;
+
+    std::uint64_t requests() const noexcept {
+        return hits + misses;
+    }
+};
+
 // Text-only Metal runtime for qwen35moe models (Qwen3.5/Qwen3.6 A3B).
 // It owns native GGUF weight buffers, full-attention KV caches, and DeltaNet
 // recurrent state. Optional NextN/MTP blocks are never loaded or executed.
@@ -39,6 +48,7 @@ public:
     std::size_t position() const noexcept;
     std::size_t max_sequence() const noexcept;
     std::size_t expert_cache_count() const noexcept;
+    ExpertCacheStats expert_cache_stats() const noexcept;
     bool uses_gpu() const noexcept;
     MemoryStats memory_stats() const noexcept;
 

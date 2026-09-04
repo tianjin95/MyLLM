@@ -768,9 +768,31 @@ void print_generation_stats(const GenerationStats & stats) {
               << " intermediate_kind="
               << (stats.memory.intermediate_is_estimate ? "estimated" : "arena")
               << " peak_memory_bytes=" << stats.memory.total_bytes()
-              << " peak_memory_mib=" << bytes_to_mib(stats.memory.total_bytes())
-              << " stopped=" << (stats.stopped ? "true" : "false")
-              << '\n';
+              << " peak_memory_mib=" << bytes_to_mib(stats.memory.total_bytes());
+    if (stats.has_expert_cache_stats) {
+        const std::uint64_t requests =
+            stats.expert_cache_hits + stats.expert_cache_misses;
+        const double hit_rate = requests == 0
+            ? 0.0
+            : 100.0 * static_cast<double>(stats.expert_cache_hits) /
+                static_cast<double>(requests);
+        std::cerr << " expert_cache_requests=" << requests
+                  << " expert_cache_hits=" << stats.expert_cache_hits
+                  << " expert_cache_misses=" << stats.expert_cache_misses
+                  << " expert_cache_hit_rate=" << hit_rate << '%';
+    }
+    std::cerr << " stopped=" << (stats.stopped ? "true" : "false") << '\n';
+}
+
+template <typename Backend>
+void capture_expert_cache_stats(const Backend &, GenerationStats &) {}
+
+void capture_expert_cache_stats(const llm::MoeLLM & backend,
+                                GenerationStats & destination) {
+    const llm::ExpertCacheStats source = backend.expert_cache_stats();
+    destination.has_expert_cache_stats = true;
+    destination.expert_cache_hits = source.hits;
+    destination.expert_cache_misses = source.misses;
 }
 
 template <typename Backend>
@@ -851,6 +873,7 @@ GenerationResult generate(Backend & backend,
 
     result.stats.total_ms = elapsed_ms(total_begin, Clock::now());
     result.stats.memory = backend.memory_stats();
+    capture_expert_cache_stats(backend, result.stats);
     return result;
 }
 
